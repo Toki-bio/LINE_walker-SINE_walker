@@ -300,30 +300,52 @@ def auto_trim(reconstruction_seq, coverage, min_cov=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Subfamily detection — search with seed, pad, cluster, consensus each
+# Subfamily detection — iterative bank-depletion (most-distant-first)
 # ═══════════════════════════════════════════════════════════════════════
 
-def detect_subfamilies(seed_fa_path, genome, outdir, sear_wd, csizes, args):
-    """Detect SINE subfamilies by clustering padded seed hits.
+def _aln_identity(ref_aln, seq_aln):
+    """Identity between two aligned sequences over ref-occupied columns.
 
-    The original seed is the shared conserved core that finds copies of
-    ALL subfamilies.  Each seed hit is extended by ±subfam_pad bp so the
-    extracted sequences include the subfamily-specific flanks.  vsearch
-    clusters these into groups; for each group a strict majority consensus
-    (min_freq=0.6) is built, which naturally trims the random genomic
-    flanking that the padding introduces.
+    Counts matching bases at positions where the reference has a base
+    (not gap).  Gives a local-identity-like metric that is independent
+    of the padded flanking length.
+    """
+    matches = ref_cols = 0
+    for i in range(min(len(ref_aln), len(seq_aln))):
+        rb = ref_aln[i].upper()
+        if rb not in 'ACGT':
+            continue
+        ref_cols += 1
+        if seq_aln[i].upper() == rb:
+            matches += 1
+    return matches / ref_cols if ref_cols else 0.0
+
+
+def detect_subfamilies(seed_fa_path, genome, outdir, sear_wd, csizes, args):
+    """Iterative bank-depletion subfamily detection.
+
+    Algorithm:
+    1. Search genome with seed → extract ±subfam_pad bp → sequence bank.
+    2. Round 1: MAFFT-align entire bank → majority consensus = subfamily 1.
+       Score all bank sequences against consensus → members (identity ≥
+       threshold) → remove from bank.
+    3. Round 2+: Among remaining bank sequences find the one **most
+       distant** from all previously found consensuses.  Cluster the
+       remaining sequences that are closer to this distant centroid than
+       to any found consensus.  MAFFT-align cluster → consensus.
+       Score remaining → members → remove.
+    4. Repeat until bank depleted or consensus too short.
+
+    The "most distant first" strategy avoids repeatedly re-extracting
+    divergent copies of an already-found subfamily.
 
     Returns list of dicts [{rank, n_members, consensus_len}, ...] or [].
     """
-    if shutil.which('vsearch') is None:
-        print("  [subfamilies] vsearch not found — skipping")
-        return []
-
     sfdir = os.path.join(outdir, 'subfamilies')
     os.makedirs(sfdir, exist_ok=True)
 
-    # ── sear search with seed ──────────────────────────────────────
-    print(f"  [subfamilies] sear search with seed for subfamily detection ...")
+    # ── 1. Build bank: search seed → pad → extract ────────────────
+    print("  [subfamilies] building sequence bank ...")
     bed_path = run_sear(sear_wd, seed_fa_path, args.search_hits, args.threads)
     if bed_path is None:
         print("  [subfamilies] no seed hits — skipping")
@@ -333,19 +355,17 @@ def detect_subfamilies(seed_fa_path, genome, outdir, sear_wd, csizes, args):
     shutil.move(bed_path, bed_dst)
 
     all_hits = parse_bed7(bed_dst)
-    # Lenient filter: length only, no bitscore filter (seed is shared core)
     usable = [h for h in all_hits if h['length'] >= args.min_hit_len]
     top = usable[:args.subfam_top_hits]
 
     if len(top) < args.branch_min * 2:
-        print(f"  [subfamilies] only {len(top)} usable hits — need at least "
-              f"{args.branch_min * 2} for 2 clusters")
+        print(f"  [subfamilies] only {len(top)} usable hits — need ≥ "
+              f"{args.branch_min * 2}")
         return []
 
     print(f"  [subfamilies] {len(all_hits)} raw → {len(usable)} usable → "
           f"taking top {len(top)}")
 
-    # ── extend hits by ±pad, extract ──────────────────────────────
     pad = args.subfam_pad
     padded_bed = os.path.join(sfdir, 'padded_hits.bed')
     n_written = 0
@@ -359,111 +379,193 @@ def detect_subfamilies(seed_fa_path, genome, outdir, sear_wd, csizes, args):
             fh.write(f"{h['chrom']}\t{s}\t{e}\thit{i}\t0\t{h['strand']}\n")
             n_written += 1
 
-    padded_fa = os.path.join(sfdir, 'padded_hits.fa')
+    bank_fa = os.path.join(sfdir, 'bank.fa')
     run(f"bedtools getfasta -s -nameOnly -fi {genome} -bed {padded_bed}"
-        f" > {padded_fa}", cwd=sfdir)
+        f" > {bank_fa}", cwd=sfdir)
 
-    print(f"  [subfamilies] extracted {n_written} padded regions "
+    bank = {name: seq for name, seq in read_multi_fasta(bank_fa)}
+    remaining = set(bank.keys())
+
+    print(f"  [subfamilies] bank: {len(bank)} sequences "
           f"(±{pad} bp around each seed hit)")
 
-    # ── vsearch cluster ──────────────────────────────────────────
-    uc_file = os.path.join(sfdir, 'clusters.uc')
-    centroids_fa = os.path.join(sfdir, 'centroids.fa')
-    try:
-        run(f"vsearch --cluster_fast {padded_fa} "
-            f"--id {args.subfam_id} "
-            f"--uc {uc_file} "
-            f"--centroids {centroids_fa} "
-            f"--threads {args.threads} "
-            f"--strand both "
-            f"--quiet",
-            cwd=sfdir)
-    except RuntimeError:
-        print("  [subfamilies] vsearch clustering failed — skipping")
-        return []
+    # ── 2. Iterative depletion ────────────────────────────────────
+    found_cons = []   # [(name, seq)]
+    results    = []
+    round_num  = 0
 
-    # ── parse cluster assignments ────────────────────────────────
-    clusters = {}
-    with open(uc_file) as fh:
-        for line in fh:
-            p = line.strip().split('\t')
-            if len(p) >= 9 and p[0] in ('S', 'H'):
-                cid = int(p[1])
-                name = p[8]
-                clusters.setdefault(cid, []).append(name)
+    while len(remaining) >= args.branch_min:
+        round_num += 1
+        rdir = os.path.join(sfdir, f'round_{round_num}')
+        os.makedirs(rdir, exist_ok=True)
 
-    all_seqs = {name: seq for name, seq in read_multi_fasta(padded_fa)}
+        print(f"\n  [subfamilies] ── round {round_num} "
+              f"({len(remaining)} sequences remaining) ──")
 
-    # Keep clusters with enough members, sort by size desc
-    valid = [(cid, mems) for cid, mems in clusters.items()
-             if len(mems) >= args.branch_min]
-    valid.sort(key=lambda x: len(x[1]), reverse=True)
+        if round_num == 1:
+            # First round: align all bank sequences
+            group_names = list(remaining)
+            print(f"  [subfamilies] aligning full bank "
+                  f"({len(group_names)} seqs)")
+        else:
+            # ── Find most distant remaining from found consensuses ──
+            score_entries = list(found_cons) + \
+                            [(n, bank[n]) for n in remaining]
+            score_fa = os.path.join(rdir, 'score_input.fa')
+            write_multi_fasta(score_fa, score_entries)
 
-    n_total_clusters = len(clusters)
-    if len(valid) < 2:
-        print(f"  [subfamilies] {n_total_clusters} clusters, "
-              f"{len(valid)} with >= {args.branch_min} members "
-              f"— no subfamily split detected")
-        return []
+            score_aln_fa = os.path.join(rdir, 'score_aligned.fa')
+            run(f"mafft --thread {args.threads} --retree 1 "
+                f"--ep 0.123 --nuc --reorder --quiet "
+                f"{score_fa} > {score_aln_fa}", cwd=rdir)
 
-    print(f"  [subfamilies] {n_total_clusters} clusters → "
-          f"{len(valid)} subfamilies (>= {args.branch_min} members):")
+            aln_dict = {n: s for n, s in read_multi_fasta(score_aln_fa)}
+            ref_names = {n for n, _ in found_cons}
 
-    # ── build per-subfamily consensus ────────────────────────────
-    results = []
-    all_cons = []
+            # For each remaining: max identity to any found consensus
+            best_found = {}
+            for rname in remaining:
+                if rname not in aln_dict:
+                    continue
+                max_id = max(
+                    (_aln_identity(aln_dict[fn], aln_dict[rname])
+                     for fn in ref_names if fn in aln_dict),
+                    default=0.0
+                )
+                best_found[rname] = max_id
 
-    for rank, (cid, members) in enumerate(valid, 1):
-        cdir = os.path.join(sfdir, f'subfamily_{rank}')
-        os.makedirs(cdir, exist_ok=True)
+            if not best_found:
+                print("  [subfamilies] no scorable sequences — done")
+                break
 
-        # Write member sequences
-        member_fa = os.path.join(cdir, 'members.fa')
-        entries = [(n, all_seqs[n]) for n in members if n in all_seqs]
-        if len(entries) < args.branch_min:
-            continue
-        write_multi_fasta(member_fa, entries)
+            centroid = min(best_found, key=best_found.get)
+            cent_dist = best_found[centroid]
+            print(f"  [subfamilies] most distant remaining: "
+                  f"identity to closest found = {cent_dist:.1%}")
 
-        # MAFFT align
-        aligned_fa = os.path.join(cdir, 'aligned.fa')
-        run(f"mafft --thread {args.threads} --localpair "
-            f"--maxiterate 1000 --ep 0.123 --nuc --reorder --quiet "
-            f"{member_fa} > {aligned_fa}", cwd=cdir)
+            # Cluster: sequences closer to centroid than to any found
+            centroid_aln = aln_dict[centroid]
+            group_names = []
+            for rname in remaining:
+                if rname not in aln_dict:
+                    continue
+                id_to_cent = _aln_identity(centroid_aln, aln_dict[rname])
+                id_to_found = best_found.get(rname, 0)
+                if id_to_cent >= id_to_found:
+                    group_names.append(rname)
 
-        # Strict consensus: min_freq=0.6 naturally trims random genomic
-        # flanking from the padded extractions
+            if len(group_names) < args.branch_min:
+                print(f"  [subfamilies] cluster around centroid: "
+                      f"{len(group_names)} < {args.branch_min} — done")
+                break
+
+            print(f"  [subfamilies] clustered {len(group_names)} sequences "
+                  f"around distant centroid")
+
+        # ── MAFFT align group → consensus ─────────────────────────
+        group_fa = os.path.join(rdir, 'group.fa')
+        write_multi_fasta(group_fa, [(n, bank[n]) for n in group_names])
+
+        aligned_fa = os.path.join(rdir, 'aligned.fa')
+        mafft_algo = ("--localpair --maxiterate 1000"
+                      if len(group_names) <= 50 else "--retree 2")
+        run(f"mafft --thread {args.threads} {mafft_algo} "
+            f"--ep 0.123 --nuc --reorder --quiet "
+            f"{group_fa} > {aligned_fa}", cwd=rdir)
+
         aligned = read_multi_fasta(aligned_fa)
         aln_seqs = [s for _, s in aligned]
         cons = majority_consensus(aln_seqs, min_depth=2, min_freq=0.6)
 
         if len(cons) < 30:
-            print(f"    subfamily {rank}: {len(entries)} members — "
-                  f"consensus too short ({len(cons)} bp), skipped")
-            continue
+            print(f"  [subfamilies] round {round_num}: consensus only "
+                  f"{len(cons)} bp — too short, done")
+            break
 
-        cons_name = f'SINE_subfamily_{rank}'
-        write_fasta(os.path.join(cdir, 'consensus.fa'), cons_name, cons)
-        write_fasta(os.path.join(outdir, f'SINE_subfamily_{rank}.fa'),
+        cons_name = f'SINE_subfamily_{round_num}'
+        write_fasta(os.path.join(rdir, 'consensus.fa'), cons_name, cons)
+
+        # ── Assign members: score all remaining against consensus ──
+        assign_entries = [(cons_name, cons)] + \
+                         [(n, bank[n]) for n in remaining]
+        assign_fa = os.path.join(rdir, 'assign_input.fa')
+        write_multi_fasta(assign_fa, assign_entries)
+
+        assign_aln_fa = os.path.join(rdir, 'assign_aligned.fa')
+        run(f"mafft --thread {args.threads} --retree 1 "
+            f"--ep 0.123 --nuc --reorder --quiet "
+            f"{assign_fa} > {assign_aln_fa}", cwd=rdir)
+
+        assign_dict = {n: s for n, s in read_multi_fasta(assign_aln_fa)}
+        cons_aln = assign_dict.get(cons_name)
+
+        members = set()
+        if cons_aln:
+            for rname in remaining:
+                if rname not in assign_dict:
+                    continue
+                ident = _aln_identity(cons_aln, assign_dict[rname])
+                if ident >= args.subfam_id:
+                    members.add(rname)
+
+        if len(members) < args.branch_min:
+            # Fall back to group itself
+            members = set(group_names) & remaining
+
+        if len(members) < args.branch_min:
+            print(f"  [subfamilies] round {round_num}: only "
+                  f"{len(members)} members — done")
+            break
+
+        # ── Refine consensus using members only ────────────────────
+        member_fa = os.path.join(rdir, 'members.fa')
+        write_multi_fasta(member_fa,
+                          [(n, bank[n]) for n in members])
+
+        member_aln_fa = os.path.join(rdir, 'members_aligned.fa')
+        mafft_algo2 = ("--localpair --maxiterate 1000"
+                       if len(members) <= 50 else "--retree 2")
+        run(f"mafft --thread {args.threads} {mafft_algo2} "
+            f"--ep 0.123 --nuc --reorder --quiet "
+            f"{member_fa} > {member_aln_fa}", cwd=rdir)
+
+        m_aligned = read_multi_fasta(member_aln_fa)
+        m_seqs = [s for _, s in m_aligned]
+        refined = majority_consensus(m_seqs, min_depth=2, min_freq=0.6)
+        if len(refined) >= 30:
+            cons = refined
+            write_fasta(os.path.join(rdir, 'consensus_refined.fa'),
+                        cons_name, cons)
+
+        # ── Save outputs ────────────────────────────────────────────
+        write_fasta(os.path.join(outdir, f'SINE_subfamily_{round_num}.fa'),
                     cons_name, cons)
 
-        results.append(dict(rank=rank, n_members=len(entries),
+        remaining -= members
+        found_cons.append((cons_name, cons))
+        results.append(dict(rank=round_num, n_members=len(members),
                             consensus_len=len(cons)))
-        all_cons.append((cons_name, cons))
 
-        print(f"    subfamily {rank}: {len(entries)} members → "
-              f"{len(cons)} bp consensus")
+        print(f"  [subfamilies] subfamily {round_num}: {len(members)} members "
+              f"→ {len(cons)} bp consensus  "
+              f"({len(remaining)} remaining in bank)")
 
-    # ── align subfamilies against each other ─────────────────────
-    if len(all_cons) >= 2:
+    # ── 3. Align all found subfamily consensuses ──────────────────
+    if len(found_cons) >= 2:
         combined_fa = os.path.join(sfdir, 'all_consensuses.fa')
-        write_multi_fasta(combined_fa, all_cons)
+        write_multi_fasta(combined_fa, found_cons)
 
         subfam_aln = os.path.join(outdir, 'SINE_subfamilies_aligned.fa')
         run(f"mafft --thread {args.threads} --localpair "
             f"--maxiterate 1000 --ep 0.123 --nuc --reorder --quiet "
             f"{combined_fa} > {subfam_aln}", cwd=sfdir)
-        print(f"  [subfamilies] subfamily alignment: "
+        print(f"\n  [subfamilies] subfamily alignment: "
               f"SINE_subfamilies_aligned.fa")
+
+    if not results:
+        print("  [subfamilies] no subfamilies detected")
+    else:
+        print(f"\n  [subfamilies] {len(results)} subfamilies detected")
 
     return results
 
@@ -835,15 +937,15 @@ def main():
     g = ap.add_argument_group('subfamily detection')
     g.add_argument('--no-subfam',       action='store_true',
                    help='Skip subfamily detection entirely.')
-    g.add_argument('--subfam-id',       type=float, default=0.50,
-                   help='vsearch cluster identity for subfamilies '
-                        '(default: 0.50). The extended regions include random '
-                        'genomic flanking, which lowers pairwise identity.')
-    g.add_argument('--subfam-pad',      type=int,   default=200,
+    g.add_argument('--subfam-id',       type=float, default=0.60,
+                   help='Identity threshold (over consensus-occupied columns) '
+                        'for assigning bank sequences to a subfamily '
+                        '(default: 0.60).')
+    g.add_argument('--subfam-pad',      type=int,   default=500,
                    help='Pad each seed hit by this many bp on each side '
-                        'before clustering (default: 200).')
+                        'to build the sequence bank (default: 500).')
     g.add_argument('--subfam-top-hits', type=int,   default=100,
-                   help='Max hits used for subfamily clustering '
+                   help='Max seed hits used for the sequence bank '
                         '(default: 100).')
 
     g = ap.add_argument_group('system')
