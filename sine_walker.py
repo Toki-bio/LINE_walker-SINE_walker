@@ -468,36 +468,49 @@ def do_fallback_alignment(arm_name, hit_pool, reconstruction_seq,
 # Final alignment of top hits vs completed reconstruction
 # ═══════════════════════════════════════════════════════════════════════
 
-def do_final_alignment(reconstruction_seq, hit_pool_5, hit_pool_3,
-                       genome, outdir, args):
-    """Align top accumulated hits (both arms) against full reconstruction."""
+def do_final_alignment(reconstruction_seq, genome, outdir,
+                       sear_wd, args):
+    """Search genome with full reconstruction; extract & align top hits.
+
+    Instead of using the fragment-sized pool hits (which are only ~40 bp each),
+    we re-search the genome with the complete reconstruction so sear finds
+    full-element-length copies.
+    """
     fdir = os.path.join(outdir, 'final_alignment')
     os.makedirs(fdir, exist_ok=True)
 
-    # Merge both hit pools, re-sort, take top N
-    merged = {}
-    for h in hit_pool_5.top(args.fallback_hits) + hit_pool_3.top(args.fallback_hits):
-        key = (h['chrom'], h['start'], h['end'], h['strand'])
-        if key not in merged or h['bitscore'] > merged[key]['bitscore']:
-            merged[key] = h
-    top_hits = sorted(merged.values(), key=lambda h: h['bitscore'], reverse=True)
-    top_hits = top_hits[:args.fallback_hits]
+    # Write reconstruction as sear query
+    recon_fa = os.path.join(fdir, 'reconstruction.fa')
+    write_fasta(recon_fa, 'SINE_reconstruction', reconstruction_seq)
 
-    if not top_hits:
+    print(f"  [final_alignment] sear search with {len(reconstruction_seq)} bp "
+          f"reconstruction ...")
+    bed_path = run_sear(sear_wd, recon_fa, args.search_hits, args.threads)
+
+    if bed_path is None:
         print("  [final_alignment] no hits — skipping")
         return None
 
-    print(f"  [final_alignment] aligning top {len(top_hits)} hits "
-          f"against full reconstruction ...")
+    bed_dst = os.path.join(fdir, 'sear_hits.bed')
+    shutil.move(bed_path, bed_dst)
+
+    all_hits  = parse_bed7(bed_dst)
+    filtered  = filter_hits(all_hits, args.min_hit_len,
+                            args.min_bitscore_frac)
+    top_hits  = filtered[:args.fallback_hits]
+
+    if not top_hits:
+        print("  [final_alignment] no hits after filtering — skipping")
+        return None
+
+    print(f"  [final_alignment] {len(all_hits)} raw → {len(filtered)} "
+          f"filtered → top {len(top_hits)} for alignment ...")
 
     hit_bed = os.path.join(fdir, 'top_hits.bed')
     write_hit_bed(top_hits, hit_bed)
     hits_fa = os.path.join(fdir, 'top_hits.fa')
     run(f"bedtools getfasta -s -nameOnly -fi {genome} -bed {hit_bed}"
         f" > {hits_fa}", cwd=fdir)
-
-    recon_fa = os.path.join(fdir, 'reconstruction.fa')
-    write_fasta(recon_fa, 'SINE_reconstruction', reconstruction_seq)
 
     combined_fa = os.path.join(fdir, 'combined.fa')
     run(f"cat {recon_fa} {hits_fa} > {combined_fa}", cwd=fdir)
@@ -678,10 +691,7 @@ def main():
     # ── final alignment: top hits vs full reconstruction ───────────────
     print()
     do_final_alignment(
-        reconstruction,
-        arm_pool.get('5prime', HitPool()),
-        arm_pool.get('3prime', HitPool()),
-        genome, args.outdir, args
+        reconstruction, genome, args.outdir, sear_wd, args
     )
 
     # ── log ───────────────────────────────────────────────────────────
