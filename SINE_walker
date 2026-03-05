@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────
+# SINE_walker — reconstruct full SINE elements from a seed fragment
+#
+# Usage:
+#   SINE_walker -s seed.fa -g genome.fa -o outdir/ [options]
+#
+# Walks bidirectionally (5′ and 3′) from the seed using 30–50 bp
+# fragment steps. Each arm searches independently with sear, then
+# extends via flank extraction → mafft → majority-vote consensus.
+#
+# When an arm stops (no significant hits), the best accumulated hits
+# across all steps are aligned against the current reconstruction for
+# inspection.
+#
+# Final output:
+#   SINE_reconstruction.fa       — full reconstructed element
+#   SINE_top_hits_aligned.fa     — mafft alignment of top genomic hits
+#   walk_log.json                — per-step stats
+#
+# See:  python3 sine_walker.py --help   for all options
+# ──────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── dependency check ──────────────────────────────────────────────────
+missing=()
+for tool in sear samtools bedtools mafft python3; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "ERROR: missing programs: ${missing[*]}" >&2
+  echo "       Install them or activate the correct conda environment." >&2
+  exit 1
+fi
+
+exec python3 "$SCRIPT_DIR/sine_walker.py" "$@"
