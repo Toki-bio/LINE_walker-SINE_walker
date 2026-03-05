@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────
+# LINE_walker — reconstruct full LINE elements from a SINE tail seed
+#
+# Usage:
+#   LINE_walker -s seed.fa -g genome.fa -o outdir/ [options]
+#
+# Iteratively walks along genomic LINE copies using:
+#   sear (search) → bedtools (flank extraction) → mafft (alignment)
+#   → vsearch (clustering) → consensus → extend → repeat
+#
+# See:  python3 line_walker.py --help   for all options
+# ──────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── dependency check ──────────────────────────────────────────────────
+missing=()
+for tool in sear samtools bedtools mafft vsearch python3; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "ERROR: missing programs: ${missing[*]}" >&2
+  echo "       Install them or activate the correct conda environment." >&2
+  exit 1
+fi
+
+exec python3 "$SCRIPT_DIR/line_walker.py" "$@"
