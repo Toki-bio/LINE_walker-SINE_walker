@@ -237,6 +237,64 @@ def consensus_quality(aligned_seqs):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Auto-trim — trim reconstruction to the region supported by genomic hits
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_coverage_profile(aligned_fa):
+    """From a MAFFT alignment file, compute per-reconstruction-position coverage.
+
+    Coverage = number of other aligned sequences that have a base (not gap)
+    at the same column as each non-gap position of the reconstruction.
+
+    Returns list of int, length == number of bases in the reconstruction.
+    """
+    entries = read_multi_fasta(aligned_fa)
+    recon_aln = None
+    hit_alns = []
+    for name, seq in entries:
+        if name == 'SINE_reconstruction':
+            recon_aln = seq
+        else:
+            hit_alns.append(seq)
+
+    if recon_aln is None or not hit_alns:
+        return []
+
+    coverage = []
+    for i in range(len(recon_aln)):
+        if recon_aln[i].upper() not in 'ACGT':
+            continue  # skip gap columns in reconstruction row
+        n = sum(1 for s in hit_alns
+                if i < len(s) and s[i].upper() in 'ACGT')
+        coverage.append(n)
+    return coverage
+
+
+def auto_trim(reconstruction_seq, coverage, min_cov=3):
+    """Trim reconstruction to the region supported by >= min_cov hits.
+
+    Scans inward from both ends until coverage meets the threshold.
+    Returns (trimmed_seq, trim_5p_bp, trim_3p_bp).
+    """
+    n = len(coverage)
+    if n == 0 or n != len(reconstruction_seq):
+        return reconstruction_seq, 0, 0
+
+    left = 0
+    while left < n and coverage[left] < min_cov:
+        left += 1
+
+    right = n - 1
+    while right >= 0 and coverage[right] < min_cov:
+        right -= 1
+
+    if left > right:
+        return reconstruction_seq, 0, 0  # can't trim
+
+    return reconstruction_seq[left:right + 1], left, n - 1 - right
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Hit pool — deduplicated accumulator across steps of one arm
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -474,7 +532,10 @@ def do_final_alignment(reconstruction_seq, genome, outdir,
 
     Instead of using the fragment-sized pool hits (which are only ~40 bp each),
     we re-search the genome with the complete reconstruction so sear finds
-    full-element-length copies.
+    full-element-length copies.  Then auto-trim the reconstruction to the
+    region actually supported by genomic hits.
+
+    Returns (aligned_fa_path, trimmed_seq_or_None).
     """
     fdir = os.path.join(outdir, 'final_alignment')
     os.makedirs(fdir, exist_ok=True)
@@ -489,7 +550,7 @@ def do_final_alignment(reconstruction_seq, genome, outdir,
 
     if bed_path is None:
         print("  [final_alignment] no hits — skipping")
-        return None
+        return None, None
 
     bed_dst = os.path.join(fdir, 'sear_hits.bed')
     shutil.move(bed_path, bed_dst)
@@ -497,11 +558,11 @@ def do_final_alignment(reconstruction_seq, genome, outdir,
     all_hits  = parse_bed7(bed_dst)
     filtered  = filter_hits(all_hits, args.min_hit_len,
                             args.min_bitscore_frac)
-    top_hits  = filtered[:args.fallback_hits]
+    top_hits  = filtered[:args.final_top_hits]
 
     if not top_hits:
         print("  [final_alignment] no hits after filtering — skipping")
-        return None
+        return None, None
 
     print(f"  [final_alignment] {len(all_hits)} raw → {len(filtered)} "
           f"filtered → top {len(top_hits)} for alignment ...")
@@ -524,8 +585,26 @@ def do_final_alignment(reconstruction_seq, genome, outdir,
     shutil.copy(hits_fa,    os.path.join(outdir, 'SINE_top_hits.fa'))
     shutil.copy(aligned_fa, os.path.join(outdir, 'SINE_top_hits_aligned.fa'))
 
+    # ── auto-trim ─────────────────────────────────────────────────────
+    trimmed_seq = None
+    coverage = compute_coverage_profile(aligned_fa)
+    if coverage:
+        trimmed, t5, t3 = auto_trim(
+            reconstruction_seq, coverage, min_cov=args.trim_min_cov)
+        if t5 > 0 or t3 > 0:
+            trimmed_path = os.path.join(outdir,
+                                        'SINE_reconstruction_trimmed.fa')
+            write_fasta(trimmed_path, 'SINE_trimmed', trimmed)
+            trimmed_seq = trimmed
+            print(f"  [auto-trim] {len(reconstruction_seq)} → "
+                  f"{len(trimmed)} bp  "
+                  f"(cut {t5} bp 5′, {t3} bp 3′)")
+        else:
+            print("  [auto-trim] full reconstruction supported — "
+                  "no trimming needed")
+
     print(f"  [final_alignment] done: {aligned_fa}")
-    return aligned_fa
+    return aligned_fa, trimmed_seq
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -556,7 +635,10 @@ def main():
     g.add_argument('--fragment',     type=int,   default=40,
                    help='Fragment size in bp for each extension step (default: 40)')
     g.add_argument('--fallback-hits', type=int,  default=10,
-                   help='Top accumulated hits for fallback/final alignment (default: 10)')
+                   help='Top accumulated hits for fallback alignment (default: 10)')
+    g.add_argument('--final-top-hits', type=int, default=30,
+                   help='Top hits used in full-reconstruction final alignment '
+                        '(default: 30). More hits → better auto-trim coverage.')
 
     g = ap.add_argument_group('quality / noise guards')
     g.add_argument('--branch-min',       type=int,   default=3,
@@ -571,6 +653,10 @@ def main():
                    help='Min fraction of alignment columns with strict majority '
                         'vote >50%% (default: 0.5). Low value = noisy flanks → '
                         'step fails rather than extending on garbage.')
+    g.add_argument('--trim-min-cov',    type=int,   default=3,
+                   help='Auto-trim: min number of hits covering each position '
+                        '(default: 3). Positions at the edges with fewer hits '
+                        'are trimmed from the reconstruction.')
 
     g = ap.add_argument_group('system')
     g.add_argument('--threads',      type=int,   default=4,
@@ -690,7 +776,7 @@ def main():
 
     # ── final alignment: top hits vs full reconstruction ───────────────
     print()
-    do_final_alignment(
+    _, trimmed_seq = do_final_alignment(
         reconstruction, genome, args.outdir, sear_wd, args
     )
 
@@ -705,6 +791,8 @@ def main():
     log['reconstruction_len'] = len(reconstruction)
     log['prefix_len']  = len(prefix)
     log['suffix_len']  = len(suffix)
+    if trimmed_seq:
+        log['trimmed_len'] = len(trimmed_seq)
 
     log_path = os.path.join(args.outdir, 'walk_log.json')
     with open(log_path, 'w') as fh:
@@ -714,6 +802,10 @@ def main():
     print('=' * 60)
     print('SINE_walker done')
     print(f'  Reconstruction : {recon_path}  ({len(reconstruction)} bp)')
+    if trimmed_seq:
+        print(f'  Trimmed        : '
+              f'{os.path.join(args.outdir, "SINE_reconstruction_trimmed.fa")}  '
+              f'({len(trimmed_seq)} bp)')
     print(f'  Top hits       : {os.path.join(args.outdir, "SINE_top_hits.fa")}')
     print(f'  Aligned hits   : {os.path.join(args.outdir, "SINE_top_hits_aligned.fa")}')
     print(f'  Log            : {log_path}')
