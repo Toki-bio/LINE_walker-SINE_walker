@@ -423,6 +423,10 @@ def main():
                    help='vsearch cluster identity (default: 0.80)')
     g.add_argument('--branch-min',  type=int,   default=3,
                    help='Min seqs per cluster to keep (default: 3)')
+    g.add_argument('--max-variants', type=int,  default=3,
+                   help='Max LINE variants (branches) to pursue '
+                        '(default: 3). Extra clusters are discarded '
+                        'by ascending member count.')
 
     g = ap.add_argument_group('system')
     g.add_argument('--threads',     type=int,   default=4,
@@ -453,7 +457,7 @@ def main():
     print(f"  Direction : {args.direction}")
     print(f"  Pipeline  : sear -s {args.search_hits} → top {args.top_hits} "
           f"→ {args.flank} bp flank → cluster @{args.cluster_id} "
-          f"→ branch ≥{args.branch_min}")
+          f"→ branch ≥{args.branch_min}  max-variants: {args.max_variants}")
     print()
 
     log = dict(
@@ -486,6 +490,16 @@ def main():
         if not exts:
             finished.append((acc, ext, bp, 'stopped'))
             continue
+
+        # ── cap total branches at --max-variants ──────────────────
+        active_branches = len(queue) + len(finished)
+        if len(exts) > 1:
+            slots = max(1, args.max_variants - active_branches)
+            if slots < len(exts):
+                # keep the clusters with the most members (most robust)
+                exts = exts[:slots]
+                print(f"  [branch cap] keeping {slots} of original "
+                      f"clusters (--max-variants {args.max_variants})")
 
         if len(exts) == 1:
             new_acc = acc + exts[0][0]

@@ -3,7 +3,7 @@
 Iterative seed-extension tools for reconstructing full transposable element sequences from a single genomic fragment.
 
 Both tools use the same core approach:
-**sear** (Smith-Waterman search) → **bedtools** (flanking sequence extraction) → **mafft** (multiple alignment) → **majority-vote consensus** → repeat.
+**sear** (Smith-Waterman / minimap2 search) → **bedtools** (flanking sequence extraction) → **mafft** (multiple alignment) → **majority-vote consensus** → repeat.
 
 ---
 
@@ -11,7 +11,7 @@ Both tools use the same core approach:
 
 ### LINE_walker
 
-Reconstructs a full LINE element starting from a known SINE tail (or any LINE fragment). Walks in one direction (default: upstream = toward LINE 5′ end) following the LINE body step by step.
+Reconstructs a full LINE element starting from a known SINE tail (or any LINE fragment). Walks in one direction (default: upstream = toward LINE 5′ end) following the LINE body step by step. Clusters flanks with vsearch at each step to detect variant branches; by default pursues at most 3 LINE variants (`--max-variants 3`).
 
 ```
 LINE_walker -s sine_tail.fa -g genome.fa -o outdir/ [options]
@@ -32,6 +32,7 @@ SINE_walker -s seed.fa -g genome.fa -o outdir/ [options]
 | Tool | Purpose |
 |---|---|
 | `sear` | Fast Smith-Waterman genome search (part of SINEderella) |
+| `minimap2` | Long-query genome search (auto-used by sear for queries ≥1000 bp) |
 | `samtools` | Genome indexing (`faidx`) |
 | `bedtools` | Flanking sequence extraction (`getfasta`) |
 | `mafft` | Multiple sequence alignment |
@@ -39,6 +40,22 @@ SINE_walker -s seed.fa -g genome.fa -o outdir/ [options]
 | `python3` | ≥ 3.8 |
 
 Activate the appropriate conda environment before running.
+
+---
+
+## sear — minimap2 mode
+
+When the query sequence is **≥ 1000 bp**, sear automatically switches from ssearch36 (fragment-scanning) to **minimap2** for faster, whole-genome alignment. This is particularly important for LINE_walker, where accumulated queries grow beyond what ssearch36 handles efficiently.
+
+**Sensitivity cascade:** sear tries minimap2 presets in order — `asm5` → `asm10` → `asm20` — stopping at the first preset that finds hits. This ensures the most exact matches are preferred while still finding divergent copies.
+
+**`-b` auto-sizing:** When `-b` is used without an explicit N:
+- Query < 5000 bp → `-b 10` (10 best hits aligned)
+- Query ≥ 5000 bp → `-b 5` (5 best hits aligned)
+
+An explicit value (e.g. `-b 20`) always overrides the auto-sizing.
+
+**Override:** Use `--force-ssearch` to disable minimap2 and force ssearch36 for all query lengths.
 
 ---
 
@@ -61,6 +78,8 @@ search tuning:
 clustering:
   --cluster-id   F     vsearch cluster identity (default: 0.80)
   --branch-min   N     Min seqs per cluster to continue (default: 3)
+  --max-variants N     Max LINE variants (branches) to pursue (default: 3).
+                       Extra clusters are discarded by ascending member count.
 
 system:
   --threads      N     Threads for mafft / sear (default: 4)
@@ -144,6 +163,7 @@ LINE_walker \
   --direction upstream \
   --flank 150 \
   --steps 30 \
+  --max-variants 3 \
   --threads 8
 ```
 
