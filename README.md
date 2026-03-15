@@ -73,7 +73,9 @@ search tuning:
   --top-hits     N     Keep N best hits by bitscore (default: 20)
   --flank        N     Flank extraction size in bp (default: 150)
   --seed-window  N     Use last N bp of accumulated seq as query (default: 200)
-  --direction          upstream | downstream (default: upstream)
+  --direction          upstream | downstream | left | right (default: upstream)
+  --max-jump     N     Continuity filter: max distance from previous-step
+                       loci for fresh sear hits (default: 5000)
 
 extended-flank optimization:
   --extended-flank N   Flank size in bp when reusing previous-step hit
@@ -106,6 +108,15 @@ system:
 - If that path fails (too few usable flanks/consensus), LINE_walker
   automatically falls back to a fresh genome search using the normal
   `--flank` size (default 150 bp).
+
+**Integrity behavior (LINE_walker):**
+- No "all-flanks as single group" fallback is used anymore when clustering
+  fails; the branch stops instead.
+- After fallback fresh `sear`, hits are continuity-filtered against the
+  previous-step loci (`--max-jump`) to reduce branch jumping across unrelated
+  genomic copies.
+- `upstream/downstream` are strand-aware (TE-oriented), while `left/right`
+  are absolute genomic-coordinate directions.
 
 ---
 

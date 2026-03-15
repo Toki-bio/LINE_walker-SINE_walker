@@ -197,15 +197,57 @@ def parse_bed7(path):
     return hits
 
 
+def write_bed7(hits, out_path):
+    """Write list of hit dicts as 7-column BED."""
+    with open(out_path, 'w') as fh:
+        for h in hits:
+            fh.write(
+                f"{h['chrom']}\t{h['start']}\t{h['end']}\t"
+                f"{h['homology']}\t{h['length']}\t{h['strand']}\t"
+                f"{h['bitscore']}\n"
+            )
+
+
+def _interval_distance(a_start, a_end, b_start, b_end):
+    if a_end < b_start:
+        return b_start - a_end
+    if b_end < a_start:
+        return a_start - b_end
+    return 0
+
+
+def filter_hits_by_previous_loci(all_hits, prev_hits, max_jump):
+    """Keep hits close to previous-step loci on same chrom/strand.
+
+    This preserves branch continuity and prevents branch jumping to unrelated
+    genomic copies when a fresh sear search is required.
+    """
+    if not prev_hits:
+        return all_hits
+
+    kept = []
+    for h in all_hits:
+        for p in prev_hits:
+            if h['chrom'] != p['chrom'] or h['strand'] != p['strand']:
+                continue
+            if _interval_distance(h['start'], h['end'],
+                                  p['start'], p['end']) <= max_jump:
+                kept.append(h)
+                break
+    return kept
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Flank coordinate logic
 # ═══════════════════════════════════════════════════════════════════════
 
 def write_flank_bed(hits, direction, flank_size, csizes, out_path):
-    """Write strand-aware flank-only BED.
+    """Write flank-only BED.
 
     direction='downstream'  →  3′ end of the hit (on its strand)
     direction='upstream'    →  5′ end of the hit (on its strand)
+    direction='right'       →  higher genomic coordinates (absolute)
+    direction='left'        →  lower genomic coordinates (absolute)
 
     Returns number of valid flanks written.
     """
@@ -213,7 +255,11 @@ def write_flank_bed(hits, direction, flank_size, csizes, out_path):
     with open(out_path, 'w') as fh:
         for i, h in enumerate(hits):
             clen = csizes.get(h['chrom'], 10**9)
-            if direction == 'downstream':
+            if direction == 'right':
+                fs, fe = h['end'], min(h['end'] + flank_size, clen)
+            elif direction == 'left':
+                fs, fe = max(0, h['start'] - flank_size), h['start']
+            elif direction == 'downstream':
                 if h['strand'] == '+':
                     fs, fe = h['end'], min(h['end'] + flank_size, clen)
                 else:
@@ -247,16 +293,16 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
     extracts a larger window (args.extended_flank bp) in the walk direction,
     then runs the full align → cluster → consensus pipeline.
 
-    Returns list of (consensus_seq, label) or empty list if failed.
+    Returns (extensions, hits_bed7) or ([], None) if failed.
     """
     try:
         all_hits = parse_bed7(prev_hits_bed)
     except Exception:
-        return []
+        return [], None
 
     top = all_hits[:args.top_hits]
     if len(top) < args.branch_min:
-        return []
+        return [], None
 
     ext_sd = os.path.join(sd, 'ext')
     os.makedirs(ext_sd, exist_ok=True)
@@ -266,18 +312,18 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
                          ext_flank_bed)
     if nf < args.branch_min:
         print(f"  [{tag}] extended: only {nf} usable flanks — skip")
-        return []
+        return [], None
 
     ext_flanks_fa = os.path.join(ext_sd, 'flanks.fa')
     try:
         run(f"bedtools getfasta -s -nameOnly -fi {genome}"
             f" -bed {ext_flank_bed} > {ext_flanks_fa}", cwd=ext_sd)
     except RuntimeError:
-        return []
+        return [], None
 
     seqs = read_multi_fasta(ext_flanks_fa)
     if len(seqs) < args.branch_min:
-        return []
+        return [], None
 
     ext_aligned_fa = os.path.join(ext_sd, 'aligned.fa')
     print(f"  [{tag}] extended: MAFFT aligning {len(seqs)} sequences "
@@ -287,7 +333,7 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             f"--localpair --maxiterate 1000 --ep 0.123 --nuc --reorder "
             f"--quiet {ext_flanks_fa} > {ext_aligned_fa}", cwd=ext_sd)
     except RuntimeError:
-        return []
+        return [], None
 
     clu_dir = os.path.join(ext_sd, 'clusters')
     os.makedirs(clu_dir, exist_ok=True)
@@ -299,7 +345,7 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             f"--centroids {ctr} --uc {uc} --clusters {pfx} --quiet",
             cwd=ext_sd)
     except RuntimeError:
-        return []
+        return [], None
 
     cluster_files = sorted(
         f for f in os.listdir(clu_dir)
@@ -314,7 +360,11 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             qualifying.append(members)
 
     if not qualifying:
-        qualifying = [seqs]
+        print(f"  [{tag}] extended: no clusters ≥{args.branch_min} — stop")
+        return [], None
+
+    ext_hits_bed = os.path.join(ext_sd, 'extended_hits.bed')
+    write_bed7(top, ext_hits_bed)
 
     extensions = []
     for ci, members in enumerate(qualifying):
@@ -349,7 +399,7 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
         print(f"  [{tag}] extended cluster {label}: {len(members)} seqs → "
               f"{len(cons)} bp consensus")
 
-    return extensions
+    return extensions, ext_hits_bed
 
 
 def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
@@ -378,8 +428,9 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             and os.path.exists(prev_hits_bed)):
         print(f"  [{tag}] trying extended flanks "
               f"({args.extended_flank} bp, direction={args.direction}) ...")
-        ext_exts = _try_extended_flanks(step_num, tag, prev_hits_bed, genome,
-                                        sd, args, csizes)
+        ext_exts, ext_hits_bed = _try_extended_flanks(
+            step_num, tag, prev_hits_bed, genome, sd, args, csizes
+        )
         if ext_exts:
             stats['status'] = 'extended_from_prev_hits'
             stats['extended_flank_size'] = args.extended_flank
@@ -387,7 +438,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
                 dict(branch=l, length=len(s)) for s, l in ext_exts
             ]
             _dump_stats(stats, sd)
-            return ext_exts, None
+            return ext_exts, ext_hits_bed
         print(f"  [{tag}] extended extraction failed — falling back to sear")
 
     # 1 ── sear search ─────────────────────────────────────────────────
@@ -404,6 +455,22 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
 
     # 2 ── select top hits by bitscore ─────────────────────────────────
     all_hits = parse_bed7(bed_dst)
+    if prev_hits_bed is not None and os.path.exists(prev_hits_bed):
+        prev_hits = parse_bed7(prev_hits_bed)
+        filtered = filter_hits_by_previous_loci(all_hits, prev_hits,
+                                                args.max_jump)
+        if filtered:
+            stats['hits_before_continuity_filter'] = len(all_hits)
+            stats['hits_after_continuity_filter'] = len(filtered)
+            all_hits = filtered
+        else:
+            stats['status'] = 'no_continuous_hits'
+            stats['hits_before_continuity_filter'] = len(all_hits)
+            stats['hits_after_continuity_filter'] = 0
+            print(f"  [{tag}] continuity filter kept 0 hits — stop")
+            _dump_stats(stats, sd)
+            return [], bed_dst
+
     top = all_hits[:args.top_hits]
     stats['hits_total'] = len(all_hits)
     stats['hits_used']  = len(top)
@@ -475,13 +542,11 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
           f"{len(qualifying)} with ≥{args.branch_min} members")
 
     # 6 ── build consensus ─────────────────────────────────────────────
-    # If no cluster has ≥ branch_min members, fall back to treating
-    # ALL flanks as a single group (use the MAFFT alignment already done).
     if not qualifying:
-        print(f"  [{tag}] no clusters ≥{args.branch_min} — "
-              f"using all {len(seqs)} flanks as single group")
-        qualifying = [seqs]
-        stats['fallback_single_group'] = True
+        print(f"  [{tag}] no clusters ≥{args.branch_min} — stop")
+        stats['status'] = 'no_qualifying_cluster'
+        _dump_stats(stats, sd)
+        return [], bed_dst
 
     extensions = []
     for ci, members in enumerate(qualifying):
@@ -541,9 +606,10 @@ def main():
     ap.add_argument('-o', '--outdir', required=True,
                     help='Output directory')
     ap.add_argument('-d', '--direction', default='upstream',
-                    choices=('upstream', 'downstream'),
-                    help='Walk direction relative to seed on its strand '
-                         '(default: upstream — toward LINE 5′ end)')
+                    choices=('upstream', 'downstream', 'left', 'right'),
+                    help='Walk direction: upstream/downstream (strand-aware) '
+                        'or left/right (absolute genomic coordinates). '
+                        '(default: upstream)')
 
     g = ap.add_argument_group('search tuning')
     g.add_argument('--steps',       type=int,   default=30,
@@ -557,6 +623,10 @@ def main():
     g.add_argument('--seed-window', type=int,   default=200,
                    help='Use last N bp of accumulated seq as query '
                         '(default: 200)')
+    g.add_argument('--max-jump', type=int, default=5000,
+                   help='Max genomic distance (bp) from previous-step hits '
+                        'allowed when continuity filtering fresh sear hits '
+                        '(default: 5000)')
 
     g = ap.add_argument_group('extended-flank optimization')
     g.add_argument('--extended-flank', type=int, default=500,
