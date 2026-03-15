@@ -666,8 +666,8 @@ def main():
                    help='vsearch cluster identity (default: 0.80)')
     g.add_argument('--branch-min',  type=int,   default=3,
                    help='Min seqs per cluster to keep (default: 3)')
-        g.add_argument('--rescue-min-members', type=int, default=2,
-                    help='If no cluster reaches --branch-min, rescue only the '
+    g.add_argument('--rescue-min-members', type=int, default=2,
+                   help='If no cluster reaches --branch-min, rescue only the '
                         'single largest cluster when it has at least this '
                         'many members (default: 2)')
     g.add_argument('--max-variants', type=int,  default=3,
