@@ -6,7 +6,10 @@ Given a SINE tail sequence and a genome, walks along genomic LINE copies
 to reconstruct the full LINE element step by step.
 
 Pipeline per step:
-  seed → sear -s 15 -k  (stop at 15 hits, reuse genome splits)
+    (optional) extended-flank fast path:
+             prev-step hits → bedtools getfasta (--extended-flank bp)
+             → MAFFT align → vsearch cluster → consensus  [early exit if OK]
+    fallback: seed → sear -s 15 -k  (stop at 15 hits, reuse genome splits)
        → sort by bitscore, take top 10
        → extract 150 bp directional flank (strand-aware)
        → MAFFT align flanks
@@ -236,12 +239,132 @@ def _dump_stats(stats, step_dir):
         json.dump(stats, fh, indent=2)
 
 
+def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
+                         csizes):
+    """Attempt extended flank extraction from previous step's sear hits.
+
+    Uses the same genomic hit locations discovered in the prior step but
+    extracts a larger window (args.extended_flank bp) in the walk direction,
+    then runs the full align → cluster → consensus pipeline.
+
+    Returns list of (consensus_seq, label) or empty list if failed.
+    """
+    try:
+        all_hits = parse_bed7(prev_hits_bed)
+    except Exception:
+        return []
+
+    top = all_hits[:args.top_hits]
+    if len(top) < args.branch_min:
+        return []
+
+    ext_sd = os.path.join(sd, 'ext')
+    os.makedirs(ext_sd, exist_ok=True)
+
+    ext_flank_bed = os.path.join(ext_sd, 'flanks.bed')
+    nf = write_flank_bed(top, args.direction, args.extended_flank, csizes,
+                         ext_flank_bed)
+    if nf < args.branch_min:
+        print(f"  [{tag}] extended: only {nf} usable flanks — skip")
+        return []
+
+    ext_flanks_fa = os.path.join(ext_sd, 'flanks.fa')
+    try:
+        run(f"bedtools getfasta -s -nameOnly -fi {genome}"
+            f" -bed {ext_flank_bed} > {ext_flanks_fa}", cwd=ext_sd)
+    except RuntimeError:
+        return []
+
+    seqs = read_multi_fasta(ext_flanks_fa)
+    if len(seqs) < args.branch_min:
+        return []
+
+    ext_aligned_fa = os.path.join(ext_sd, 'aligned.fa')
+    print(f"  [{tag}] extended: MAFFT aligning {len(seqs)} sequences "
+          f"({args.extended_flank} bp flanks) ...")
+    try:
+        run(f"mafft --thread {args.threads} --threadtb {args.threads} "
+            f"--localpair --maxiterate 1000 --ep 0.123 --nuc --reorder "
+            f"--quiet {ext_flanks_fa} > {ext_aligned_fa}", cwd=ext_sd)
+    except RuntimeError:
+        return []
+
+    clu_dir = os.path.join(ext_sd, 'clusters')
+    os.makedirs(clu_dir, exist_ok=True)
+    ctr = os.path.join(clu_dir, 'centroids.fa')
+    uc = os.path.join(clu_dir, 'clusters.uc')
+    pfx = os.path.join(clu_dir, 'cluster_')
+    try:
+        run(f"vsearch --cluster_fast {ext_flanks_fa} --id {args.cluster_id} "
+            f"--centroids {ctr} --uc {uc} --clusters {pfx} --quiet",
+            cwd=ext_sd)
+    except RuntimeError:
+        return []
+
+    cluster_files = sorted(
+        f for f in os.listdir(clu_dir)
+        if f.startswith('cluster_')
+        and f not in ('centroids.fa', 'clusters.uc')
+        and not f.endswith('.uc') and not f.endswith('.fa')
+    )
+    qualifying = []
+    for cf in cluster_files:
+        members = read_multi_fasta(os.path.join(clu_dir, cf))
+        if len(members) >= args.branch_min:
+            qualifying.append(members)
+
+    if not qualifying:
+        qualifying = [seqs]
+
+    extensions = []
+    for ci, members in enumerate(qualifying):
+        label = chr(65 + ci)
+        cfa = os.path.join(ext_sd, f'cluster_{label}.fa')
+        calign = os.path.join(ext_sd, f'cluster_{label}_aligned.fa')
+        ccons = os.path.join(ext_sd, f'consensus_{label}.fa')
+
+        write_multi_fasta(cfa, members)
+
+        if len(qualifying) == 1 and os.path.exists(ext_aligned_fa):
+            aligned = read_multi_fasta(ext_aligned_fa)
+        elif len(members) > 1:
+            try:
+                run(f"mafft --thread {args.threads} --localpair "
+                    f"--maxiterate 1000 --ep 0.123 --nuc --reorder --quiet "
+                    f"{cfa} > {calign}", cwd=ext_sd)
+            except RuntimeError:
+                continue
+            aligned = read_multi_fasta(calign)
+        else:
+            aligned = members
+
+        cons = majority_consensus([s for _, s in aligned])
+        if len(cons) < 30:
+            print(f"  [{tag}] extended cluster {label}: consensus only "
+                  f"{len(cons)} bp — skip")
+            continue
+
+        write_fasta(ccons, f'step{step_num}_{label}_ext', cons)
+        extensions.append((cons, label))
+        print(f"  [{tag}] extended cluster {label}: {len(members)} seqs → "
+              f"{len(cons)} bp consensus")
+
+    return extensions
+
+
 def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
-              branch=''):
+              branch='', prev_hits_bed=None):
     """Execute one walking step.
 
-    Returns list of (consensus_seq, cluster_label) for next steps.
-    Empty list → this branch stops.
+    If args.try_extended_first is True and prev_hits_bed is available, first
+    attempts to extract extended flanks (args.extended_flank bp) from the
+    previous step's sear hits before falling back to a full genome search.
+
+    Returns (extensions, next_hits_bed) where extensions is a list of
+    (consensus_seq, cluster_label) for next steps and next_hits_bed is the
+    path to the sear BED file to pass to the following step (None when the
+    extended-extraction fast path was taken). Empty extensions list means
+    this branch stops.
     """
     tag = f"step_{step_num:03d}" + (f"_branch_{branch}" if branch else "")
     sd  = os.path.join(outdir, tag)
@@ -250,6 +373,23 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
 
     stats = dict(step=step_num, branch=branch, tag=tag)
 
+    if (args.try_extended_first
+            and prev_hits_bed is not None
+            and os.path.exists(prev_hits_bed)):
+        print(f"  [{tag}] trying extended flanks "
+              f"({args.extended_flank} bp, direction={args.direction}) ...")
+        ext_exts = _try_extended_flanks(step_num, tag, prev_hits_bed, genome,
+                                        sd, args, csizes)
+        if ext_exts:
+            stats['status'] = 'extended_from_prev_hits'
+            stats['extended_flank_size'] = args.extended_flank
+            stats['extensions'] = [
+                dict(branch=l, length=len(s)) for s, l in ext_exts
+            ]
+            _dump_stats(stats, sd)
+            return ext_exts, None
+        print(f"  [{tag}] extended extraction failed — falling back to sear")
+
     # 1 ── sear search ─────────────────────────────────────────────────
     print(f"  [{tag}] sear -s {args.search_hits} ...")
     bed_src = run_sear(sear_wd, query_fa, args.search_hits, args.threads)
@@ -257,7 +397,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
         print(f"  [{tag}] no hits")
         stats['status'] = 'no_hits'
         _dump_stats(stats, sd)
-        return []
+        return [], None
 
     bed_dst = os.path.join(sd, 'sear_hits.bed')
     shutil.move(bed_src, bed_dst)
@@ -272,7 +412,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     if len(top) < args.branch_min:
         stats['status'] = 'too_few_hits'
         _dump_stats(stats, sd)
-        return []
+        return [], bed_dst
 
     # 3 ── extract directional flanks ──────────────────────────────────
     flank_bed = os.path.join(sd, 'flanks.bed')
@@ -281,7 +421,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
         print(f"  [{tag}] only {nf} usable flanks (need {args.branch_min})")
         stats['status'] = 'too_few_flanks'
         _dump_stats(stats, sd)
-        return []
+        return [], bed_dst
 
     flanks_fa = os.path.join(sd, 'flanks.fa')
     run(f"bedtools getfasta -s -nameOnly -fi {genome} -bed {flank_bed}"
@@ -291,7 +431,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     if len(seqs) < args.branch_min:
         stats['status'] = 'too_few_flanks'
         _dump_stats(stats, sd)
-        return []
+        return [], bed_dst
     stats['flanks'] = len(seqs)
 
     # 4 ── MAFFT align flanks ──────────────────────────────────────────
@@ -383,7 +523,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     else:
         stats['status'] = 'no_usable_consensus'
     _dump_stats(stats, sd)
-    return extensions
+    return extensions, bed_dst
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -417,6 +557,21 @@ def main():
     g.add_argument('--seed-window', type=int,   default=200,
                    help='Use last N bp of accumulated seq as query '
                         '(default: 200)')
+
+    g = ap.add_argument_group('extended-flank optimization')
+    g.add_argument('--extended-flank', type=int, default=500,
+                   help='Flank size in bp for extended extraction from '
+                        'previous step\'s hits before falling back to '
+                        'genome search (default: 500)')
+    g.add_argument('--try-extended-first', dest='try_extended_first',
+                   action='store_true', default=True,
+                   help='Attempt extended flank extraction from previous '
+                        'step\'s hits before running genome search '
+                        '(default: enabled)')
+    g.add_argument('--no-try-extended-first', dest='try_extended_first',
+                   action='store_false',
+                   help='Disable extended flank optimization; always run '
+                        'genome search (reverts to original behaviour)')
 
     g = ap.add_argument_group('clustering')
     g.add_argument('--cluster-id',  type=float, default=0.80,
@@ -458,6 +613,9 @@ def main():
     print(f"  Pipeline  : sear -s {args.search_hits} → top {args.top_hits} "
           f"→ {args.flank} bp flank → cluster @{args.cluster_id} "
           f"→ branch ≥{args.branch_min}  max-variants: {args.max_variants}")
+    if args.try_extended_first:
+        print(f"  Extended  : try {args.extended_flank} bp from prev hits "
+              f"before genome search (--try-extended-first)")
     print()
 
     log = dict(
@@ -466,12 +624,13 @@ def main():
     )
 
     # ── walking BFS ───────────────────────────────────────────────────
-    # queue items: (accumulated_seq, extension_only, branch_path, next_step)
-    queue    = [(seed_seq, '', '', 1)]
+    # queue items: (accumulated_seq, extension_only, branch_path, next_step,
+    #               prev_hits_bed)
+    queue    = [(seed_seq, '', '', 1, None)]
     finished = []                       # (acc, ext, branch, reason)
 
     while queue:
-        acc, ext, bp, step = queue.pop(0)
+        acc, ext, bp, step, prev_hits_bed = queue.pop(0)
 
         if step > args.steps:
             print(f"  [branch {bp or 'main'}] max steps reached")
@@ -483,8 +642,9 @@ def main():
         qfa  = os.path.join(args.outdir, f'_q_{bp or "main"}_s{step}.fa')
         write_fasta(qfa, f'q_s{step}', qseq)
 
-        exts = walk_step(step, qfa, genome, args.outdir, sear_wd,
-                         args, csizes, bp)
+        exts, new_hits_bed = walk_step(step, qfa, genome, args.outdir,
+                           sear_wd, args, csizes, bp,
+                           prev_hits_bed)
         os.remove(qfa)
 
         if not exts:
@@ -504,14 +664,15 @@ def main():
         if len(exts) == 1:
             new_acc = acc + exts[0][0]
             new_ext = ext + exts[0][0]
-            queue.append((new_acc, new_ext, bp, step + 1))
+            queue.append((new_acc, new_ext, bp, step + 1, new_hits_bed))
             print(f"  → {len(new_acc)} bp  (branch {bp or 'main'})")
         else:
             for seq, lbl in exts:
                 new_bp  = (bp + lbl) if bp else lbl
                 new_acc = acc + seq
                 new_ext = ext + seq
-                queue.append((new_acc, new_ext, new_bp, step + 1))
+                queue.append((new_acc, new_ext, new_bp, step + 1,
+                              new_hits_bed))
                 print(f"  → fork {new_bp}: {len(new_acc)} bp")
         print()
 
