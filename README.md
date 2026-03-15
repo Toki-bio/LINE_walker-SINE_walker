@@ -89,6 +89,10 @@ extended-flank optimization:
 clustering:
   --cluster-id   F     vsearch cluster identity (default: 0.80)
   --branch-min   N     Min seqs per cluster to continue (default: 3)
+  --rescue-min-members N
+                       If no cluster reaches --branch-min, rescue only the
+                       single largest cluster when it has at least N members
+                       (default: 2)
   --max-variants N     Max LINE variants (branches) to pursue (default: 3).
                        Extra clusters are discarded by ascending member count.
 
@@ -110,8 +114,10 @@ system:
   `--flank` size (default 150 bp).
 
 **Integrity behavior (LINE_walker):**
-- No "all-flanks as single group" fallback is used anymore when clustering
-  fails; the branch stops instead.
+- No "all-flanks as single group" fallback is used anymore.
+- If no cluster reaches `--branch-min`, only the **single largest cluster** can
+  be rescued (controlled by `--rescue-min-members`), which preserves integrity
+  better than mixed-flank consensus.
 - After fallback fresh `sear`, hits are continuity-filtered against the
   previous-step loci (`--max-jump`) to reduce branch jumping across unrelated
   genomic copies.

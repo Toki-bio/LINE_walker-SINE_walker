@@ -354,14 +354,22 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
         and not f.endswith('.uc') and not f.endswith('.fa')
     )
     qualifying = []
+    cluster_members_all = []
     for cf in cluster_files:
         members = read_multi_fasta(os.path.join(clu_dir, cf))
+        cluster_members_all.append(members)
         if len(members) >= args.branch_min:
             qualifying.append(members)
 
     if not qualifying:
-        print(f"  [{tag}] extended: no clusters ≥{args.branch_min} — stop")
-        return [], None
+        largest = max(cluster_members_all, key=len) if cluster_members_all else []
+        if len(largest) >= args.rescue_min_members:
+            qualifying = [largest]
+            print(f"  [{tag}] extended: no clusters ≥{args.branch_min}; "
+                  f"rescue largest cluster ({len(largest)} seqs)")
+        else:
+            print(f"  [{tag}] extended: no clusters ≥{args.branch_min} — stop")
+            return [], None
 
     ext_hits_bed = os.path.join(ext_sd, 'extended_hits.bed')
     write_bed7(top, ext_hits_bed)
@@ -527,8 +535,10 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
         and not f.endswith('.uc') and not f.endswith('.fa')
     )
     qualifying = []
+    cluster_members_all = []
     for cf in cluster_files:
         members = read_multi_fasta(os.path.join(clu_dir, cf))
+        cluster_members_all.append(members)
         if len(members) >= args.branch_min:
             qualifying.append(members)
 
@@ -543,10 +553,18 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
 
     # 6 ── build consensus ─────────────────────────────────────────────
     if not qualifying:
-        print(f"  [{tag}] no clusters ≥{args.branch_min} — stop")
-        stats['status'] = 'no_qualifying_cluster'
-        _dump_stats(stats, sd)
-        return [], bed_dst
+        largest = max(cluster_members_all, key=len) if cluster_members_all else []
+        if len(largest) >= args.rescue_min_members:
+            qualifying = [largest]
+            stats['rescue_single_cluster'] = True
+            stats['rescue_cluster_size'] = len(largest)
+            print(f"  [{tag}] no clusters ≥{args.branch_min}; "
+                  f"rescue largest cluster ({len(largest)} seqs)")
+        else:
+            print(f"  [{tag}] no clusters ≥{args.branch_min} — stop")
+            stats['status'] = 'no_qualifying_cluster'
+            _dump_stats(stats, sd)
+            return [], bed_dst
 
     extensions = []
     for ci, members in enumerate(qualifying):
@@ -648,6 +666,10 @@ def main():
                    help='vsearch cluster identity (default: 0.80)')
     g.add_argument('--branch-min',  type=int,   default=3,
                    help='Min seqs per cluster to keep (default: 3)')
+        g.add_argument('--rescue-min-members', type=int, default=2,
+                    help='If no cluster reaches --branch-min, rescue only the '
+                        'single largest cluster when it has at least this '
+                        'many members (default: 2)')
     g.add_argument('--max-variants', type=int,  default=3,
                    help='Max LINE variants (branches) to pursue '
                         '(default: 3). Extra clusters are discarded '
