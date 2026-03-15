@@ -237,6 +237,21 @@ def filter_hits_by_previous_loci(all_hits, prev_hits, max_jump):
     return kept
 
 
+def select_hits_for_clustering(all_hits, cluster_hits, min_bitscore_frac):
+    """Select a broader, score-filtered pool of hits for flank clustering.
+
+    The old logic used only the first --top-hits entries, which can miss a
+    coherent family if the high-scoring tail is spread across many near-ties.
+    """
+    if not all_hits:
+        return []
+
+    top_bitscore = all_hits[0]['bitscore']
+    min_bitscore = top_bitscore * min_bitscore_frac
+    selected = [h for h in all_hits if h['bitscore'] >= min_bitscore]
+    return selected[:cluster_hits]
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Flank coordinate logic
 # ═══════════════════════════════════════════════════════════════════════
@@ -300,15 +315,18 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
     except Exception:
         return [], None
 
-    top = all_hits[:args.top_hits]
-    if len(top) < args.branch_min:
+    selected_hits = select_hits_for_clustering(
+        all_hits, args.cluster_hits, args.min_bitscore_frac
+    )
+    if len(selected_hits) < args.branch_min:
         return [], None
 
     ext_sd = os.path.join(sd, 'ext')
     os.makedirs(ext_sd, exist_ok=True)
 
     ext_flank_bed = os.path.join(ext_sd, 'flanks.bed')
-    nf = write_flank_bed(top, args.direction, args.extended_flank, csizes,
+    nf = write_flank_bed(selected_hits, args.direction, args.extended_flank,
+                         csizes,
                          ext_flank_bed)
     if nf < args.branch_min:
         print(f"  [{tag}] extended: only {nf} usable flanks — skip")
@@ -372,7 +390,7 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             return [], None
 
     ext_hits_bed = os.path.join(ext_sd, 'extended_hits.bed')
-    write_bed7(top, ext_hits_bed)
+    write_bed7(selected_hits, ext_hits_bed)
 
     extensions = []
     for ci, members in enumerate(qualifying):
@@ -480,18 +498,26 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             return [], bed_dst
 
     top = all_hits[:args.top_hits]
+    cluster_hits = select_hits_for_clustering(
+        all_hits, args.cluster_hits, args.min_bitscore_frac
+    )
     stats['hits_total'] = len(all_hits)
     stats['hits_used']  = len(top)
+    stats['cluster_hits_used'] = len(cluster_hits)
+    stats['cluster_min_bitscore_frac'] = args.min_bitscore_frac
     print(f"  [{tag}] {len(all_hits)} hits → top {len(top)} by bitscore")
+    print(f"  [{tag}] clustering pool: {len(cluster_hits)} hits "
+          f"(bitscore ≥ top×{args.min_bitscore_frac})")
 
-    if len(top) < args.branch_min:
+    if len(cluster_hits) < args.branch_min:
         stats['status'] = 'too_few_hits'
         _dump_stats(stats, sd)
         return [], bed_dst
 
     # 3 ── extract directional flanks ──────────────────────────────────
     flank_bed = os.path.join(sd, 'flanks.bed')
-    nf = write_flank_bed(top, args.direction, args.flank, csizes, flank_bed)
+    nf = write_flank_bed(cluster_hits, args.direction, args.flank, csizes,
+                         flank_bed)
     if nf < args.branch_min:
         print(f"  [{tag}] only {nf} usable flanks (need {args.branch_min})")
         stats['status'] = 'too_few_flanks'
@@ -635,7 +661,14 @@ def main():
     g.add_argument('--search-hits', type=int,   default=50,
                    help='sear: stop after N hits (default: 50)')
     g.add_argument('--top-hits',    type=int,   default=20,
-                   help='Keep N best hits by bitscore (default: 20)')
+                   help='Keep N best hits by bitscore for reporting and '
+                        'inspection (default: 20)')
+    g.add_argument('--cluster-hits', type=int, default=100,
+                   help='Max number of near-top hits used for flank '
+                        'clustering/consensus (default: 100)')
+    g.add_argument('--min-bitscore-frac', type=float, default=0.90,
+                   help='Keep hits with bitscore at least top_bitscore × F '
+                        'for clustering pool selection (default: 0.90)')
     g.add_argument('--flank',       type=int,   default=150,
                    help='Flank extraction size in bp (default: 150)')
     g.add_argument('--seed-window', type=int,   default=200,

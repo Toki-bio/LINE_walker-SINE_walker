@@ -70,7 +70,13 @@ required:
 search tuning:
   --steps        N     Max walking steps (default: 30)
   --search-hits  N     sear: stop after N hits per step (default: 50)
-  --top-hits     N     Keep N best hits by bitscore (default: 20)
+  --top-hits     N     Keep N best hits by bitscore for reporting/inspection
+                       (default: 20)
+  --cluster-hits N     Max number of near-top hits used for flank clustering
+                       and consensus (default: 100)
+  --min-bitscore-frac F
+                       Keep hits with bitscore at least top_bitscore × F for
+                       clustering pool selection (default: 0.90)
   --flank        N     Flank extraction size in bp (default: 150)
   --seed-window  N     Use last N bp of accumulated seq as query (default: 200)
   --direction          upstream | downstream | left | right (default: upstream)
@@ -118,6 +124,9 @@ system:
 - If no cluster reaches `--branch-min`, only the **single largest cluster** can
   be rescued (controlled by `--rescue-min-members`), which preserves integrity
   better than mixed-flank consensus.
+- Clustering no longer uses only the first `--top-hits` records; it now uses a
+  broader score-filtered pool (`--cluster-hits`, `--min-bitscore-frac`) so
+  coherent copy families are less likely to be missed.
 - After fallback fresh `sear`, hits are continuity-filtered against the
   previous-step loci (`--max-jump`) to reduce branch jumping across unrelated
   genomic copies.
