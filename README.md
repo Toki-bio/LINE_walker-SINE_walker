@@ -72,16 +72,33 @@ search tuning:
   --search-hits  N     sear: stop after N hits per step (default: 50)
   --top-hits     N     Keep N best hits by bitscore for reporting/inspection
                        (default: 20)
+  --best-loci    N     For each final consensus, report top N best genomic
+                       loci by bitscore and align loci to consensus
+                       (default: 5)
+  --best-loci-search-hits N
+                       sear hit cap when mapping final consensus back to
+                       genome for best-loci reporting (default: 200)
   --cluster-hits N     Max number of near-top hits used for flank clustering
-                       and consensus (default: 100)
+                       and consensus (default: 50)
   --min-bitscore-frac F
                        Keep hits with bitscore at least top_bitscore × F for
                        clustering pool selection (default: 0.90)
   --flank        N     Flank extraction size in bp (default: 150)
   --seed-window  N     Use last N bp of accumulated seq as query (default: 200)
-  --direction          upstream | downstream | left | right (default: upstream)
+  --dedup-locus-window N
+                       Collapse same-locus near-duplicate sear hits when
+                       distance/overlap is within N bp (default: 30)
+  --direction          5prime | 3prime | upstream | downstream |
+                       left | right | both (default: upstream)
   --max-jump     N     Continuity filter: max distance from previous-step
                        loci for fresh sear hits (default: 5000)
+  --use-seed-hit-bank  Build a pseudo-genome from initial seed-hit loci and
+                       walk only inside that extracted bank
+  --bank-flank   N     Half-window around each selected seed hit for bank
+                       extraction (default: 20000)
+  --bank-max-seed-hits N
+                       Max near-top seed hits used to build bank
+                       (default: 100)
 
 extended-flank optimization:
   --extended-flank N   Flank size in bp when reusing previous-step hit
@@ -109,8 +126,39 @@ system:
 **Output:**
 - `LINE_candidates.fa` — full accumulated sequences (seed + all extensions)
 - `LINE_extensions.fa` — novel extension only
+- `best_loci/` — per-final-branch best-hit reports and alignments:
+  - `best_loci_<branch>.tsv` (ranked genomic loci with bitscores)
+  - `best_loci_<branch>.bed` (top loci BED7)
+  - `best_loci_<branch>.fa` (top loci sequences)
+  - `best_loci_<branch>_with_consensus_aligned.fa` (MAFFT alignment)
 - `walk_log.json` — per-step stats
 - `step_NNN/` — per-step intermediate files
+- `merged/LINE_merged.fa` — merged full-length sequences (only with `-d both`)
+
+**Direction handling:**
+- Walking in the 5′ direction correctly **prepends** extensions and uses the
+  leading N bp of the accumulated sequence as the next query.
+- Walking in the 3′ direction **appends** extensions and uses the trailing
+  N bp as the next query.
+
+**Best-loci search:** The final consensus (typically several kb) is searched
+against the genome using `sear --force-ssearch` to ensure ssearch36 fragment
+scanning is used instead of minimap2's asm presets, which require near-perfect
+identity and miss divergent LINE copies.  Hit coordinates are expanded to
+consensus length for full-length locus extraction.
+
+Preferred direction modes are seed-relative:
+- `5prime`: extend toward seed 5′ side
+- `3prime`: extend toward seed 3′ side
+- `upstream`/`downstream` are backward-compatible aliases for
+  `5prime`/`3prime`
+
+When `--direction both` is used, LINE_walker runs two independent
+seed-relative passes and writes outputs under `outdir/5prime/` and
+`outdir/3prime/`.  After both passes finish, merged full-length
+sequences (`[5′ extensions][seed][3′ extensions]`) are written to
+`outdir/merged/LINE_merged.fa`.  When multiple branches exist, all
+5′×3′ combinations are merged.
 
 **Extended-flank fast path (LINE_walker):**
 - By default, each step first tries reusing the **previous step's hits** and
@@ -118,6 +166,16 @@ system:
 - If that path fails (too few usable flanks/consensus), LINE_walker
   automatically falls back to a fresh genome search using the normal
   `--flank` size (default 150 bp).
+
+**Seed-hit pseudo-genome mode (LINE_walker):**
+- Enable `--use-seed-hit-bank` to perform one initial seed search on the
+  original genome, then extract ±`--bank-flank` windows around selected
+  seed-hit loci and assemble them into `outdir/_seed_hit_bank/bank.fa`.
+- After bank construction, all walking steps (including fallback `sear`)
+  run only against this limited bank genome instead of the full genome.
+- This supports fast long jumps (`--extended-flank`, e.g. 500 bp) in a
+  constrained copy set, while still allowing finer `--flank` steps
+  (e.g. 150 bp) when hard regions are encountered.
 
 **Integrity behavior (LINE_walker):**
 - No "all-flanks as single group" fallback is used anymore.
