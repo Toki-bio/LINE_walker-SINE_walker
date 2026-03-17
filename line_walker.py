@@ -14,7 +14,7 @@ Pipeline per step:
        → extract 150 bp directional flank (strand-aware)
        → MAFFT align flanks
        → vsearch cluster at 80 %
-       → ≥3 members per cluster → majority-rule consensus → extend
+    → ≥5 members per cluster → majority-rule consensus → extend
        → 1 cluster: continue;  N clusters: fork branches
 
 Stop conditions:
@@ -1087,12 +1087,12 @@ def main():
     g = ap.add_argument_group('clustering')
     g.add_argument('--cluster-id',  type=float, default=0.80,
                    help='vsearch cluster identity (default: 0.80)')
-    g.add_argument('--branch-min',  type=int,   default=3,
-                   help='Min seqs per cluster to keep (default: 3)')
-    g.add_argument('--rescue-min-members', type=int, default=2,
+    g.add_argument('--branch-min',  type=int,   default=5,
+                   help='Min seqs per cluster to keep (default: 5)')
+    g.add_argument('--rescue-min-members', type=int, default=5,
                    help='If no cluster reaches --branch-min, rescue only the '
                         'single largest cluster when it has at least this '
-                        'many members (default: 2)')
+                        'many members (default: 5)')
     g.add_argument('--max-variants', type=int,  default=3,
                    help='Max LINE variants (branches) to pursue '
                         '(default: 3). Extra clusters are discarded '

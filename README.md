@@ -111,11 +111,11 @@ extended-flank optimization:
 
 clustering:
   --cluster-id   F     vsearch cluster identity (default: 0.80)
-  --branch-min   N     Min seqs per cluster to continue (default: 3)
+  --branch-min   N     Min seqs per cluster to continue (default: 5)
   --rescue-min-members N
                        If no cluster reaches --branch-min, rescue only the
                        single largest cluster when it has at least N members
-                       (default: 2)
+                       (default: 5)
   --max-variants N     Max LINE variants (branches) to pursue (default: 3).
                        Extra clusters are discarded by ascending member count.
 
