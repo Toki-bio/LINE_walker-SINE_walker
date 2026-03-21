@@ -135,6 +135,25 @@ def majority_consensus(aligned_seqs, min_depth=2):
     return ''.join(cons)
 
 
+def trim_anchor_overlap(consensus, direction, anchor_overlap, min_extension=30):
+    """Trim the reused anchor portion from a consensus flank sequence.
+
+    Flanks can include a short already-known anchor segment to stabilize
+    clustering when sear hit endpoints jitter.  That anchor is trimmed away
+    before the extension is appended to the growing LINE consensus.
+    """
+    if anchor_overlap <= 0 or not consensus:
+        return consensus
+
+    trim_bp = min(anchor_overlap, max(0, len(consensus) - min_extension))
+    if trim_bp == 0:
+        return consensus
+
+    if direction in ('5prime', 'upstream', 'left'):
+        return consensus[:-trim_bp]
+    return consensus[trim_bp:]
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # sear integration
 # ═══════════════════════════════════════════════════════════════════════
@@ -356,7 +375,7 @@ def build_seed_hit_bank(seed_fa, source_genome, source_sear_wd, outdir, csizes,
 # ═══════════════════════════════════════════════════════════════════════
 
 def write_flank_bed(hits, direction, flank_size, csizes, out_path,
-                    offset=0):
+                    offset=0, anchor_overlap=0):
     """Write flank-only BED.
 
     direction='3prime'      →  3′ end of the seed-aligned hit (on strand)
@@ -369,32 +388,45 @@ def write_flank_bed(hits, direction, flank_size, csizes, out_path,
     re-extracting the same window.  For the normal sear path the offset
     is always 0 (the hits are already at the current position).
 
+    anchor_overlap includes a short already-known segment across the anchor
+    into the extracted sequence.  This stabilizes clustering when sear places
+    the same true locus with slightly different local hit endpoints.
+
     Returns number of valid flanks written.
     """
     n = 0
     with open(out_path, 'w') as fh:
         for i, h in enumerate(hits):
             clen = csizes.get(h['chrom'], 10**9)
+            hit_len = max(0, h['end'] - h['start'])
+            eff_overlap = anchor_overlap if offset > 0 else min(anchor_overlap,
+                                                                 hit_len)
             if direction == 'right':
                 anchor = h['end'] + offset
-                fs, fe = anchor, min(anchor + flank_size, clen)
+                fs = max(0, anchor - eff_overlap)
+                fe = min(anchor + flank_size, clen)
             elif direction == 'left':
                 anchor = h['start'] - offset
-                fs, fe = max(0, anchor - flank_size), max(0, anchor)
+                fs = max(0, anchor - flank_size)
+                fe = min(anchor + eff_overlap, clen)
             elif direction in ('downstream', '3prime'):
                 if h['strand'] == '+':
                     anchor = h['end'] + offset
-                    fs, fe = anchor, min(anchor + flank_size, clen)
+                    fs = max(0, anchor - eff_overlap)
+                    fe = min(anchor + flank_size, clen)
                 else:
                     anchor = h['start'] - offset
-                    fs, fe = max(0, anchor - flank_size), max(0, anchor)
+                    fs = max(0, anchor - flank_size)
+                    fe = min(anchor + eff_overlap, clen)
             else:  # 5prime / upstream
                 if h['strand'] == '+':
                     anchor = h['start'] - offset
-                    fs, fe = max(0, anchor - flank_size), max(0, anchor)
+                    fs = max(0, anchor - flank_size)
+                    fe = min(anchor + eff_overlap, clen)
                 else:
                     anchor = h['end'] + offset
-                    fs, fe = anchor, min(anchor + flank_size, clen)
+                    fs = max(0, anchor - eff_overlap)
+                    fe = min(anchor + flank_size, clen)
             if fe - fs < 20:
                 continue
             fh.write(f"{h['chrom']}\t{fs}\t{fe}\thit{i}\t0\t{h['strand']}\n")
@@ -437,7 +469,8 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
 
     ext_flank_bed = os.path.join(ext_sd, 'flanks.bed')
     nf = write_flank_bed(selected_hits, args.direction, args.extended_flank,
-                         csizes, ext_flank_bed, offset=ext_offset)
+                         csizes, ext_flank_bed, offset=ext_offset,
+                         anchor_overlap=args.anchor_overlap)
     if nf < args.branch_min:
         print(f"  [{tag}] extended: only {nf} usable flanks — skip")
         return [], None
@@ -495,6 +528,22 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             qualifying = [largest]
             print(f"  [{tag}] extended: no clusters ≥{args.branch_min}; "
                   f"rescue largest cluster ({len(largest)} seqs)")
+        elif os.path.exists(ext_aligned_fa):
+            aligned = read_multi_fasta(ext_aligned_fa)
+            cons = majority_consensus([s for _, s in aligned])
+            cons = trim_anchor_overlap(cons, args.direction,
+                                       args.anchor_overlap)
+            if len(cons) >= 30:
+                ext_hits_bed = os.path.join(ext_sd, 'extended_hits.bed')
+                write_bed7(selected_hits, ext_hits_bed)
+                ccons = os.path.join(ext_sd, 'consensus_aln.fa')
+                write_fasta(ccons, f'step{step_num}_aln_ext', cons)
+                print(f"  [{tag}] extended alignment fallback: "
+                      f"{len(aligned)} seqs → {len(cons)} bp consensus")
+                return [(cons, 'A')], ext_hits_bed
+            print(f"  [{tag}] extended: alignment fallback too short "
+                  f"({len(cons)} bp) — skip")
+            return [], None
         else:
             print(f"  [{tag}] extended: no clusters ≥{args.branch_min} — stop")
             return [], None
@@ -525,6 +574,7 @@ def _try_extended_flanks(step_num, tag, prev_hits_bed, genome, sd, args,
             aligned = members
 
         cons = majority_consensus([s for _, s in aligned])
+        cons = trim_anchor_overlap(cons, args.direction, args.anchor_overlap)
         if len(cons) < 30:
             print(f"  [{tag}] extended cluster {label}: consensus only "
                   f"{len(cons)} bp — skip")
@@ -561,6 +611,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     shutil.copy(query_fa, os.path.join(sd, 'query.fa'))
 
     stats = dict(step=step_num, branch=branch, tag=tag)
+    fell_back_from_extended = False
 
     if (args.try_extended_first
             and prev_hits_bed is not None
@@ -581,6 +632,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             ]
             _dump_stats(stats, sd)
             return ext_exts, ext_hits_bed, True
+        fell_back_from_extended = True
         print(f"  [{tag}] extended extraction failed — falling back to sear")
 
     # 1 ── sear search ─────────────────────────────────────────────────
@@ -600,7 +652,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     stats['hits_before_dedup'] = len(all_hits)
     all_hits = deduplicate_hits_by_locus(all_hits, args.dedup_locus_window)
     stats['hits_after_dedup'] = len(all_hits)
-    if prev_hits_bed is not None and os.path.exists(prev_hits_bed):
+    if not fell_back_from_extended and prev_hits_bed is not None and os.path.exists(prev_hits_bed):
         prev_hits = parse_bed7(prev_hits_bed)
         filtered = filter_hits_by_previous_loci(all_hits, prev_hits,
                                                 args.max_jump)
@@ -615,6 +667,8 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             print(f"  [{tag}] continuity filter kept 0 hits — stop")
             _dump_stats(stats, sd)
             return [], bed_dst, False
+    elif fell_back_from_extended:
+        print(f"  [{tag}] skipping continuity filter (sear fallback after extended mode)")
 
     top = all_hits[:args.top_hits]
     cluster_hits = select_hits_for_clustering(
@@ -636,7 +690,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     # 3 ── extract directional flanks ──────────────────────────────────
     flank_bed = os.path.join(sd, 'flanks.bed')
     nf = write_flank_bed(cluster_hits, args.direction, args.flank, csizes,
-                         flank_bed)
+                         flank_bed, anchor_overlap=args.anchor_overlap)
     if nf < args.branch_min:
         print(f"  [{tag}] only {nf} usable flanks (need {args.branch_min})")
         stats['status'] = 'too_few_flanks'
@@ -705,6 +759,29 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             stats['rescue_cluster_size'] = len(largest)
             print(f"  [{tag}] no clusters ≥{args.branch_min}; "
                   f"rescue largest cluster ({len(largest)} seqs)")
+        elif os.path.exists(aligned_fa):
+            aln_entries = read_multi_fasta(aligned_fa)
+            aln_cons = majority_consensus([s for _, s in aln_entries])
+            aln_cons = trim_anchor_overlap(aln_cons, args.direction,
+                                           args.anchor_overlap)
+            if len(aln_cons) >= 30:
+                ccons = os.path.join(sd, 'consensus_aln.fa')
+                write_fasta(ccons, f'step{step_num}_aln', aln_cons)
+                extensions = [(aln_cons, 'A')]
+                stats['status'] = 'alignment_fallback'
+                stats['alignment_consensus_len'] = len(aln_cons)
+                stats['extensions'] = [
+                    dict(branch='A', length=len(aln_cons))
+                ]
+                print(f"  [{tag}] alignment fallback: "
+                      f"{len(aln_entries)} seqs → {len(aln_cons)} bp consensus")
+                _dump_stats(stats, sd)
+                return extensions, bed_dst, False
+            print(f"  [{tag}] alignment fallback too short "
+                  f"({len(aln_cons)} bp)")
+            stats['status'] = 'no_qualifying_cluster'
+            _dump_stats(stats, sd)
+            return [], bed_dst, False
         else:
             print(f"  [{tag}] no clusters ≥{args.branch_min} — stop")
             stats['status'] = 'no_qualifying_cluster'
@@ -732,6 +809,7 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
             aligned = members
 
         cons = majority_consensus([s for _, s in aligned])
+        cons = trim_anchor_overlap(cons, args.direction, args.anchor_overlap)
 
         if len(cons) < 30:
             print(f"  [{tag}] cluster {label}: consensus only "
@@ -754,6 +832,160 @@ def walk_step(step_num, query_fa, genome, outdir, sear_wd, args, csizes,
     return extensions, bed_dst, False
 
 
+def collect_spanning_loci(run_outdir, branch, merge_window):
+    """Collect step-1 sear hit loci and count how many later steps also
+    placed a hit within merge_window of each anchor.
+
+    Only step-1 sear hits are used as anchors (they define the genuine
+    seed-matching loci).  Every subsequent step's hits are checked against
+    those anchors; any hit within merge_window is credited to the anchor.
+
+    Returns groups sorted by step_count desc then bitscore desc.
+    """
+    bp_suffix = f'_branch_{branch}' if branch else ''
+
+    # Step 1 anchors
+    step1_bed = os.path.join(run_outdir, f'step_001{bp_suffix}', 'sear_hits.bed')
+    if not os.path.exists(step1_bed) or os.path.getsize(step1_bed) == 0:
+        return []
+    anchors = parse_bed7(step1_bed)   # already sorted by bitscore desc
+    if not anchors:
+        return []
+
+    groups = [
+        {'chrom': h['chrom'], 'strand': h['strand'],
+         'min_start': h['start'], 'max_end': h['end'],
+         'bitscore': h['bitscore'], 'steps': {1}, 'n_hits': 1}
+        for h in anchors
+    ]
+
+    step = 2
+    while True:
+        tag = f'step_{step:03d}{bp_suffix}'
+        sd = os.path.join(run_outdir, tag)
+        if not os.path.exists(sd):
+            break
+        for bed_cand in [
+            os.path.join(sd, 'ext', 'extended_hits.bed'),
+            os.path.join(sd, 'sear_hits.bed'),
+        ]:
+            if os.path.exists(bed_cand) and os.path.getsize(bed_cand) > 0:
+                for h in parse_bed7(bed_cand):
+                    for g in groups:
+                        if (g['chrom'] != h['chrom']
+                                or g['strand'] != h['strand']):
+                            continue
+                        if _interval_distance(h['start'], h['end'],
+                                              g['min_start'],
+                                              g['max_end']) <= merge_window:
+                            g['max_end'] = max(g['max_end'], h['end'])
+                            g['min_start'] = min(g['min_start'], h['start'])
+                            g['steps'].add(step)
+                            g['n_hits'] += 1
+                            break
+                break
+        step += 1
+
+    for g in groups:
+        g['step_count'] = len(g['steps'])
+
+    groups.sort(key=lambda g: (-g['step_count'], -g['bitscore']))
+    return groups
+
+
+def export_spanning_evidence(finished, run_outdir, walk_genome, walk_csizes,
+                             args, walking_5prime=True):
+    """For each branch, find loci with hits spanning the most walk steps,
+    extract the LINE body region from the genome, and align with consensus.
+
+    Extraction is direction-aware: cons_len is added only into the walk
+    direction from the seed anchor; a small buffer is added on the other side.
+
+    Writes per branch:
+      spanning_evidence/<branch>.bed6
+      spanning_evidence/<branch>.fa
+      spanning_evidence/<branch>_with_consensus_aligned.fa
+
+    Returns dict: label → (n_loci, aligned_fa_path) or None.
+    """
+    evid_dir = os.path.join(run_outdir, 'spanning_evidence')
+    os.makedirs(evid_dir, exist_ok=True)
+
+    # merge_window = max_jump: same guarantee used by continuity filter
+    merge_window = args.max_jump
+
+    results = {}
+    for acc, _ext, bp, _reason in finished:
+        lbl = bp or 'main'
+        cons_len = len(acc)
+        groups = collect_spanning_loci(run_outdir, bp, merge_window)
+        if not groups:
+            print(f"  Spanning [{lbl}]: no step-1 loci found")
+            results[lbl] = None
+            continue
+
+        top = groups[:args.best_loci]
+        print(f"  Spanning [{lbl}]: top {len(top)} loci "
+              f"(best: {top[0]['step_count']} steps covered, "
+              f"anchor bitscore={top[0]['bitscore']:.1f})")
+
+        bed6 = os.path.join(evid_dir, f'{lbl}.bed6')
+        FLANK = 300  # buffer on the seed (non-walk) side
+        with open(bed6, 'w') as fh:
+            for i, g in enumerate(top, start=1):
+                clen = walk_csizes.get(g['chrom'], 10**9)
+                # Extend cons_len into the walk direction from the seed
+                # anchor, FLANK bp buffer on the other side.
+                # 5prime walk on + strand: LINE is to the LEFT of seed
+                # 5prime walk on - strand: LINE is to the RIGHT of seed
+                if walking_5prime:
+                    if g['strand'] == '+':
+                        s = max(0, g['min_start'] - cons_len - FLANK)
+                        e = min(clen, g['max_end'] + FLANK)
+                    else:
+                        s = max(0, g['min_start'] - FLANK)
+                        e = min(clen, g['max_end'] + cons_len + FLANK)
+                else:  # 3prime
+                    if g['strand'] == '+':
+                        s = max(0, g['min_start'] - FLANK)
+                        e = min(clen, g['max_end'] + cons_len + FLANK)
+                    else:
+                        s = max(0, g['min_start'] - cons_len - FLANK)
+                        e = min(clen, g['max_end'] + FLANK)
+                name = f"locus{i}_{g['chrom']}({s}-{e})"
+                fh.write(f"{g['chrom']}\t{s}\t{e}\t{name}\t0\t{g['strand']}\n")
+
+        loci_fa = os.path.join(evid_dir, f'{lbl}.fa')
+        run(f"bedtools getfasta -s -nameOnly -fi {walk_genome}"
+            f" -bed {bed6} > {loci_fa}")
+
+        loci_entries = read_multi_fasta(loci_fa)
+        if not loci_entries:
+            print(f"  Spanning [{lbl}]: bedtools returned no sequences")
+            results[lbl] = None
+            continue
+
+        to_align = os.path.join(evid_dir, f'{lbl}_with_consensus.fa')
+        aligned  = os.path.join(evid_dir, f'{lbl}_with_consensus_aligned.fa')
+        # Seed region uppercase, extensions lowercase — aids visual inspection.
+        if walking_5prime:
+            mixed_acc = acc[:len(_ext)].lower() + acc[len(_ext):]
+        else:
+            mixed_acc = acc[:len(acc) - len(_ext)] + acc[len(acc) - len(_ext):].lower()
+        write_multi_fasta(to_align, [(f'LINE_{lbl}_consensus', mixed_acc)]
+                          + loci_entries)
+
+        print(f"  Spanning [{lbl}]: MAFFT aligning "
+              f"{len(loci_entries)} loci + consensus ...")
+        run(f"mafft --thread {args.threads} --localpair --maxiterate 1000 "
+            f"--ep 0.123 --nuc --reorder --quiet {to_align} > {aligned}")
+
+        print(f"  Spanning [{lbl}]: alignment → {aligned}")
+        results[lbl] = (len(loci_entries), aligned)
+
+    return results
+
+
 def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
                                     run_outdir, args):
     """For each final consensus, report top best genomic loci and alignment.
@@ -774,13 +1006,16 @@ def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
         tag = f'LINE_{lbl}'
         cons_len = len(acc)
 
+        print(f"  Best loci [{lbl}]: sear -s {args.best_loci_search_hits} "
+              f"({cons_len} bp consensus) ...")
+
         qfa = os.path.join(loci_dir, f'{tag}_query.fa')
         write_fasta(qfa, f'{tag}_consensus', acc)
 
         bed_src = run_sear(source_sear_wd, qfa, args.best_loci_search_hits,
-                           args.threads,
-                           extra_flags='--force-ssearch')
+                           args.threads)
         if bed_src is None or os.path.getsize(bed_src) == 0:
+            print(f"  Best loci [{lbl}]: no hits")
             summary[lbl] = dict(status='no_hits')
             continue
 
@@ -820,7 +1055,7 @@ def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
         bed6 = os.path.join(loci_dir, f'best_loci_{lbl}.bed6')
         with open(bed6, 'w') as fh:
             for i, h in enumerate(top_hits, start=1):
-                name = f"{tag}_rank{i}_bs{h['bitscore']:.1f}"
+                name = f"locus{i}_{h['chrom']}({h['start']}-{h['end']})"
                 fh.write(f"{h['chrom']}\t{h['start']}\t{h['end']}\t{name}"
                          f"\t0\t{h['strand']}\n")
 
@@ -841,6 +1076,10 @@ def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
         )
         run(f"mafft --thread {args.threads} --localpair --maxiterate 1000 "
             f"--ep 0.123 --nuc --reorder --quiet {to_align} > {aligned}")
+
+        print(f"  Best loci [{lbl}]: {len(top_hits)} loci found "
+              f"(top bitscore={top_hits[0]['bitscore']:.1f})")
+        print(f"  Best loci [{lbl}]: alignment → {aligned}")
 
         summary[lbl] = dict(
             status='ok',
@@ -874,7 +1113,8 @@ def run_walk_direction(direction, seed_name, seed_seq, walk_genome, walk_csizes,
         print(f"  Genome    : {walk_genome}")
         print(f"  Direction : {effective_direction} (seed-relative)")
         print(f"  Pipeline  : sear -s {args.search_hits} → top {args.top_hits} "
-              f"→ {args.flank} bp flank → cluster @{args.cluster_id} "
+              f"→ {args.flank} bp flank (+{args.anchor_overlap} bp anchor) "
+              f"→ cluster @{args.cluster_id} "
               f"→ branch ≥{args.branch_min}  max-variants: {args.max_variants}")
         if args.try_extended_first:
             print(f"  Extended  : try {args.extended_flank} bp from prev hits "
@@ -961,14 +1201,24 @@ def run_walk_direction(direction, seed_name, seed_seq, walk_genome, walk_csizes,
                     print(f"  → fork {new_bp}: {len(new_acc)} bp")
             print()
 
+        # ── export spanning genomic evidence ────────────────────────────
+        spanning_results = export_spanning_evidence(
+            finished, run_outdir, walk_genome, walk_csizes, args, walking_5prime
+        )
+
         cand_path = os.path.join(run_outdir, 'LINE_candidates.fa')
         ext_path = os.path.join(run_outdir, 'LINE_extensions.fa')
         with open(cand_path, 'w') as fc, open(ext_path, 'w') as fe:
             for acc, ext, bp, reason in finished:
                 lbl = bp or 'main'
-                fc.write(f'>LINE_{lbl} len={len(acc)} stop={reason}\n')
-                for i in range(0, len(acc), 80):
-                    fc.write(acc[i:i + 80] + '\n')
+                # Seed region uppercase, novel extensions lowercase.
+                if walking_5prime:
+                    mixed = acc[:len(ext)].lower() + acc[len(ext):]
+                else:
+                    mixed = acc[:len(acc) - len(ext)] + acc[len(acc) - len(ext):].lower()
+                fc.write(f'>LINE_{lbl} len={len(mixed)} stop={reason}\n')
+                for i in range(0, len(mixed), 80):
+                    fc.write(mixed[i:i + 80] + '\n')
                 if ext:
                     fe.write(f'>LINE_{lbl}_ext len={len(ext)} stop={reason}\n')
                     for i in range(0, len(ext), 80):
@@ -994,6 +1244,10 @@ def run_walk_direction(direction, seed_name, seed_seq, walk_genome, walk_csizes,
         for acc, ext, bp, reason in finished:
             print(f'    {bp or "main"}: {len(acc)} bp total, '
                   f'{len(ext)} bp novel  ({reason})')
+        for lbl, res in spanning_results.items():
+            if res:
+                n, aln = res
+                print(f'  Spanning [{lbl}] : {n} loci aligned → {aln}')
         print(f'  Log: {log_path}')
         print('=' * 60)
 
@@ -1048,6 +1302,10 @@ def main():
                         'for clustering pool selection (default: 0.90)')
     g.add_argument('--flank',       type=int,   default=150,
                    help='Flank extraction size in bp (default: 150)')
+    g.add_argument('--anchor-overlap', type=int, default=60,
+                   help='Include up to N bp of already-matched sequence '
+                        'across the flank anchor to stabilize clustering; '
+                        'trimmed off before extension (default: 60)')
     g.add_argument('--seed-window', type=int,   default=200,
                    help='Use last N bp of accumulated seq as query '
                         '(default: 200)')
