@@ -986,83 +986,50 @@ def export_spanning_evidence(finished, run_outdir, walk_genome, walk_csizes,
     return results
 
 
-def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
+def export_best_loci_for_candidates(finished, spanning_results, source_genome,
                                     run_outdir, args):
-    """For each final consensus, report top best genomic loci and alignment.
+    """For each final consensus, export the top spanning loci (already found
+    during the walk) and align them with the consensus.
+
+    Re-uses loci from *spanning_results* so no expensive genome re-search
+    is needed.
 
     Writes, per branch:
-      - best_loci_<branch>.tsv
-      - best_loci_<branch>.bed
+      - best_loci_<branch>.tsv   (from spanning evidence)
       - best_loci_<branch>.fa
       - best_loci_<branch>_with_consensus_aligned.fa
     """
     loci_dir = os.path.join(run_outdir, 'best_loci')
     os.makedirs(loci_dir, exist_ok=True)
-    csizes = load_chrom_sizes(source_genome + '.fai')
 
+    evid_dir = os.path.join(run_outdir, 'spanning_evidence')
     summary = {}
     for acc, _ext, bp, _reason in finished:
         lbl = bp or 'main'
         tag = f'LINE_{lbl}'
-        cons_len = len(acc)
 
-        print(f"  Best loci [{lbl}]: sear -s {args.best_loci_search_hits} "
-              f"({cons_len} bp consensus) ...")
-
-        qfa = os.path.join(loci_dir, f'{tag}_query.fa')
-        write_fasta(qfa, f'{tag}_consensus', acc)
-
-        bed_src = run_sear(source_sear_wd, qfa, args.best_loci_search_hits,
-                           args.threads)
-        if bed_src is None or os.path.getsize(bed_src) == 0:
-            print(f"  Best loci [{lbl}]: no hits")
-            summary[lbl] = dict(status='no_hits')
+        span = spanning_results.get(lbl)
+        if not span:
+            print(f"  Best loci [{lbl}]: no spanning loci available")
+            summary[lbl] = dict(status='no_spanning_loci')
             continue
 
-        bed_all = os.path.join(loci_dir, f'best_loci_{lbl}.all.bed')
-        shutil.move(bed_src, bed_all)
-        all_hits = parse_bed7(bed_all)
-        all_hits_raw = len(all_hits)
-        all_hits = deduplicate_hits_by_locus(all_hits, args.dedup_locus_window)
-        top_hits = all_hits[:args.best_loci]
+        n_loci, span_aligned = span
 
-        if not top_hits:
-            summary[lbl] = dict(status='no_hits')
+        # Copy spanning evidence files into best_loci dir
+        span_fa = os.path.join(evid_dir, f'{lbl}.fa')
+        span_bed6 = os.path.join(evid_dir, f'{lbl}.bed6')
+        if not os.path.exists(span_fa):
+            summary[lbl] = dict(status='no_spanning_fa')
             continue
-
-        # Expand hit coordinates to cover the full consensus length
-        # (ssearch36 fragment scanning may return partial matches)
-        for h in top_hits:
-            hit_len = h['end'] - h['start']
-            if hit_len < cons_len:
-                mid = (h['start'] + h['end']) // 2
-                half = cons_len // 2
-                clen = csizes.get(h['chrom'], 10**9)
-                h['start'] = max(0, mid - half)
-                h['end'] = min(clen, mid + half + cons_len % 2)
-
-        bed_top = os.path.join(loci_dir, f'best_loci_{lbl}.bed')
-        write_bed7(top_hits, bed_top)
-
-        tsv = os.path.join(loci_dir, f'best_loci_{lbl}.tsv')
-        with open(tsv, 'w') as fh:
-            fh.write('rank\tchrom\tstart\tend\tstrand\tbitscore\thomology\tlength\n')
-            for i, h in enumerate(top_hits, start=1):
-                fh.write(f"{i}\t{h['chrom']}\t{h['start']}\t{h['end']}\t"
-                         f"{h['strand']}\t{h['bitscore']:.3f}\t"
-                         f"{h['homology']:.3f}\t{h['length']}\n")
-
-        bed6 = os.path.join(loci_dir, f'best_loci_{lbl}.bed6')
-        with open(bed6, 'w') as fh:
-            for i, h in enumerate(top_hits, start=1):
-                name = f"locus{i}_{h['chrom']}({h['start']}-{h['end']})"
-                fh.write(f"{h['chrom']}\t{h['start']}\t{h['end']}\t{name}"
-                         f"\t0\t{h['strand']}\n")
 
         loci_fa = os.path.join(loci_dir, f'best_loci_{lbl}.fa')
-        run(f"bedtools getfasta -s -nameOnly -fi {source_genome} -bed {bed6}"
-            f" > {loci_fa}")
+        shutil.copy(span_fa, loci_fa)
+        if os.path.exists(span_bed6):
+            shutil.copy(span_bed6,
+                        os.path.join(loci_dir, f'best_loci_{lbl}.bed6'))
 
+        # Align consensus with the top loci
         aligned = os.path.join(
             loci_dir, f'best_loci_{lbl}_with_consensus_aligned.fa'
         )
@@ -1077,16 +1044,12 @@ def export_best_loci_for_candidates(finished, source_genome, source_sear_wd,
         run(f"mafft --thread {args.threads} --localpair --maxiterate 1000 "
             f"--ep 0.123 --nuc --reorder --quiet {to_align} > {aligned}")
 
-        print(f"  Best loci [{lbl}]: {len(top_hits)} loci found "
-              f"(top bitscore={top_hits[0]['bitscore']:.1f})")
+        print(f"  Best loci [{lbl}]: {n_loci} loci from spanning evidence")
         print(f"  Best loci [{lbl}]: alignment → {aligned}")
 
         summary[lbl] = dict(
             status='ok',
-            hits_before_dedup=all_hits_raw,
-            hits_after_dedup=len(all_hits),
-            top_hits=len(top_hits),
-            top_bitscore=top_hits[0]['bitscore']
+            top_hits=n_loci,
         )
 
     return summary
@@ -1229,7 +1192,7 @@ def run_walk_direction(direction, seed_name, seed_seq, walk_genome, walk_csizes,
             for a, e, b, r in finished
         }
         log['best_loci'] = export_best_loci_for_candidates(
-            finished, source_genome, source_sear_wd, run_outdir, args
+            finished, spanning_results, source_genome, run_outdir, args
         )
 
         log_path = os.path.join(run_outdir, 'walk_log.json')
